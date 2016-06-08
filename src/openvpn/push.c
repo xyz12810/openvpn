@@ -40,6 +40,30 @@
 
 #if P2MP
 
+/**
+ * Add an option to the push list by providing a format string.
+ *
+ * The string added to the push options is allocated in o->gc, so the caller
+ * does not have to preserve anything.
+ *
+ * @param o		The current connection's options
+ * @param msglevel	The message level to use when printing errors
+ * @param fmt		Format string for the option
+ * @param ...		Format string arguments
+ *
+ * @return true on success, false on failure.
+ */
+static bool push_option_fmt(struct options *o, int msglevel,
+    const char *fmt, ...)
+#ifdef __GNUC__
+#if __USE_MINGW_ANSI_STDIO
+    __attribute__ ((format (gnu_printf, 3, 4)))
+#else
+    __attribute__ ((format (__printf__, 3, 4)))
+#endif
+#endif
+    ;
+
 /*
  * Auth username/password
  *
@@ -76,8 +100,11 @@ receive_auth_failed (struct context *c, const struct buffer *buffer)
 	  if (buf_string_compare_advance (&buf, "AUTH_FAILED,") && BLEN (&buf))
 	    reason = BSTR (&buf);
 	  management_auth_failure (management, UP_TYPE_AUTH, reason);
-	} else
+	}
 #endif
+      /*
+       * Save the dynamic-challenge text even when management is defined
+       */
 	{
 #ifdef ENABLE_CLIENT_CR
 	  struct buffer buf = *buffer;
@@ -105,6 +132,7 @@ server_pushed_signal (struct context *c, const struct buffer *buffer, const bool
 	m = BSTR (&buf);
 
       /* preserve cached passwords? */
+      /* advance to next server? */
       {
 	bool purge = true;
 
@@ -115,6 +143,11 @@ server_pushed_signal (struct context *c, const struct buffer *buffer, const bool
 	      {
 		if (m[i] == 'P')
 		  purge = false;
+		else if (m[i] == 'N')
+		  {
+		    /* next server? */
+		    c->options.no_advance = false;
+		  }
 	      }
 	  }
 	if (purge)
@@ -233,7 +266,47 @@ send_push_request (struct context *c)
 
 #if P2MP_SERVER
 
-bool
+/**
+ * Prepare push options, based on local options and available peer info.
+ *
+ * @param options	Connection options
+ * @param tls_multi	TLS state structure for the current tunnel
+ *
+ * @return true on success, false on failure.
+ */
+static bool
+prepare_push_reply (struct options *o, struct tls_multi *tls_multi)
+{
+  const char *optstr = NULL;
+  const char * const peer_info = tls_multi->peer_info;
+
+  /* Send peer-id if client supports it */
+  optstr = peer_info ? strstr(peer_info, "IV_PROTO=") : NULL;
+  if (optstr)
+    {
+      int proto = 0;
+      int r = sscanf(optstr, "IV_PROTO=%d", &proto);
+      if ((r == 1) && (proto >= 2))
+	{
+	  push_option_fmt(o, M_USAGE, "peer-id %d", tls_multi->peer_id);
+	}
+    }
+
+  /* Push cipher if client supports Negotiable Crypto Parameters */
+  optstr = peer_info ? strstr(peer_info, "IV_NCP=") : NULL;
+  if (optstr)
+    {
+      int ncp = 0;
+      int r = sscanf(optstr, "IV_NCP=%d", &ncp);
+      if ((r == 1) && (ncp == 2))
+	{
+	  push_option_fmt(o, M_USAGE, "cipher %s", o->ciphername);
+	}
+    }
+  return true;
+}
+
+static bool
 send_push_reply (struct context *c)
 {
   struct gc_arena gc = gc_new ();
@@ -249,7 +322,8 @@ send_push_reply (struct context *c)
 
   buf_printf (&buf, "%s", cmd);
 
-  if ( c->c2.push_ifconfig_ipv6_defined )
+  if ( c->c2.push_ifconfig_ipv6_defined &&
+          !c->options.push_ifconfig_ipv6_blocked )
     {
       /* IPv6 is put into buffer first, could be lengthy */
       buf_printf( &buf, ",ifconfig-ipv6 %s/%d %s",
@@ -302,19 +376,6 @@ send_push_reply (struct context *c)
     }
   if (multi_push)
     buf_printf (&buf, ",push-continuation 1");
-
-  /* Send peer-id if client supports it */
-  if (c->c2.tls_multi->peer_info)
-    {
-      const char* proto_str = strstr(c->c2.tls_multi->peer_info, "IV_PROTO=");
-      if (proto_str)
-	{
-	  int proto = 0;
-	  int r = sscanf(proto_str, "IV_PROTO=%d", &proto);
-	  if ((r == 1) && (proto >= 2))
-	    buf_printf(&buf, ",peer-id %d", c->c2.tls_multi->peer_id);
-	}
-  }
 
   if (BLEN (&buf) > sizeof(cmd)-1)
     {
@@ -403,10 +464,99 @@ push_options (struct options *o, char **p, int msglevel, struct gc_arena *gc)
   push_option (o, opt, msglevel);
 }
 
+static bool push_option_fmt(struct options *o, int msglevel,
+    const char *format, ...)
+{
+  va_list arglist;
+  char tmp[256] = {0};
+  int len = -1;
+  va_start (arglist, format);
+  len = vsnprintf (tmp, sizeof(tmp), format, arglist);
+  va_end (arglist);
+  if (len > sizeof(tmp)-1)
+    return false;
+  push_option (o, string_alloc (tmp, &o->gc), msglevel);
+  return true;
+}
+
 void
 push_reset (struct options *o)
 {
   CLEAR (o->push_list);
+}
+
+void
+push_remove_option (struct options *o, const char *p)
+{
+  msg( D_PUSH, "PUSH_REMOVE '%s'", p );
+
+  /* ifconfig-ipv6 is special, as not part of the push list */
+  if ( streq( p, "ifconfig-ipv6" ))
+    {
+      o->push_ifconfig_ipv6_blocked = true;
+      return;
+    }
+
+  if (o && o->push_list.head )
+    {
+      struct push_entry *e = o->push_list.head;
+
+      /* cycle through the push list */
+      while (e)
+	{
+	  if ( e->enable &&
+               strncmp( e->option, p, strlen(p) ) == 0 )
+	    {
+	      msg (D_PUSH, "PUSH_REMOVE removing: '%s'", e->option);
+	      e->enable = false;
+	    }
+
+	  e = e->next;
+	}
+    }
+}
+#endif
+
+#if P2MP_SERVER
+int
+process_incoming_push_request (struct context *c)
+{
+  int ret = PUSH_MSG_ERROR;
+
+#ifdef ENABLE_ASYNC_PUSH
+  c->c2.push_request_received = true;
+#endif
+  if (tls_authentication_status (c->c2.tls_multi, 0) == TLS_AUTHENTICATION_FAILED || c->c2.context_auth == CAS_FAILED)
+    {
+      const char *client_reason = tls_client_reason (c->c2.tls_multi);
+      send_auth_failed (c, client_reason);
+      ret = PUSH_MSG_AUTH_FAILURE;
+    }
+  else if (!c->c2.push_reply_deferred && c->c2.context_auth == CAS_SUCCEEDED)
+    {
+      time_t now;
+
+      openvpn_time (&now);
+      if (c->c2.sent_push_reply_expiry > now)
+	{
+	  ret = PUSH_MSG_ALREADY_REPLIED;
+	}
+      else
+	{
+	  if (prepare_push_reply(&c->options, c->c2.tls_multi) &&
+	      send_push_reply (c))
+	    {
+	      ret = PUSH_MSG_REQUEST;
+	      c->c2.sent_push_reply_expiry = now + 30;
+	    }
+	}
+    }
+  else
+    {
+      ret = PUSH_MSG_REQUEST_DEFERRED;
+    }
+
+  return ret;
 }
 #endif
 
@@ -423,34 +573,7 @@ process_incoming_push_msg (struct context *c,
 #if P2MP_SERVER
   if (buf_string_compare_advance (&buf, "PUSH_REQUEST"))
     {
-      if (tls_authentication_status (c->c2.tls_multi, 0) == TLS_AUTHENTICATION_FAILED || c->c2.context_auth == CAS_FAILED)
-	{
-	  const char *client_reason = tls_client_reason (c->c2.tls_multi);
-	  send_auth_failed (c, client_reason);
-	  ret = PUSH_MSG_AUTH_FAILURE;
-	}
-      else if (!c->c2.push_reply_deferred && c->c2.context_auth == CAS_SUCCEEDED)
-	{
-	  time_t now;
-
-	  openvpn_time(&now);
-	  if (c->c2.sent_push_reply_expiry > now)
-	    {
-	      ret = PUSH_MSG_ALREADY_REPLIED;
-	    }
-	  else
-	    {
-	      if (send_push_reply (c))
-		{
-		  ret = PUSH_MSG_REQUEST;
-		  c->c2.sent_push_reply_expiry = now + 30;
-		}
-	    }
-	}
-      else
-	{
-	  ret = PUSH_MSG_REQUEST_DEFERRED;
-	}
+      ret = process_incoming_push_request(c);
     }
   else
 #endif
@@ -522,7 +645,8 @@ remove_iroutes_from_push_route_list (struct options *o)
 
 	  /* parse the push item */
 	  CLEAR (p);
-	  if (parse_line (e->option, p, SIZE (p), "[PUSH_ROUTE_REMOVE]", 1, D_ROUTE_DEBUG, &gc))
+	  if ( e->enable &&
+               parse_line (e->option, p, SIZE (p), "[PUSH_ROUTE_REMOVE]", 1, D_ROUTE_DEBUG, &gc))
 	    {
 	      /* is the push item a route directive? */
 	      if (p[0] && !strcmp (p[0], "route") && !p[3])
@@ -548,12 +672,12 @@ remove_iroutes_from_push_route_list (struct options *o)
 			}
 		    }
 		}
-	    }
 
-	  /* should we copy the push item? */
-	  e->enable = enable;
-	  if (!enable)
-	    msg (D_PUSH, "REMOVE PUSH ROUTE: '%s'", e->option);
+	      /* should we copy the push item? */
+	      e->enable = enable;
+	      if (!enable)
+		msg (D_PUSH, "REMOVE PUSH ROUTE: '%s'", e->option);
+	    }
 
 	  e = e->next;
 	}

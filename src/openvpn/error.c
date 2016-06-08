@@ -228,7 +228,7 @@ void x_msg_va (const unsigned int flags, const char *format, va_list arglist)
 
 #ifndef HAVE_VARARG_MACROS
   /* the macro has checked this otherwise */
-  if (!MSG_TEST (flags))
+  if (!msg_test (flags))
     return;
 #endif
 
@@ -394,9 +394,13 @@ dont_mute (unsigned int flags)
 }
 
 void
-assert_failed (const char *filename, int line)
+assert_failed (const char *filename, int line, const char *condition)
 {
-  msg (M_FATAL, "Assertion failed at %s:%d", filename, line);
+  if (condition)
+    msg (M_FATAL, "Assertion failed at %s:%d (%s)", filename, line, condition);
+  else
+    msg (M_FATAL, "Assertion failed at %s:%d", filename, line);
+  _exit(1);
 }
 
 /*

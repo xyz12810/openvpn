@@ -150,8 +150,6 @@ char *backend_x509_get_serial_hex (openvpn_x509_cert_t *cert,
  */
 void x509_setenv (struct env_set *es, int cert_depth, openvpn_x509_cert_t *cert);
 
-#ifdef ENABLE_X509_TRACK
-
 /*
  * Start tracking the given attribute.
  *
@@ -188,8 +186,6 @@ void x509_track_add (const struct x509_track **ll_head, const char *name,
  */
 void x509_setenv_track (const struct x509_track *xt, struct env_set *es,
     const int depth, openvpn_x509_cert_t *x509);
-
-#endif
 
 /*
  * Check X.509 Netscape certificate type field, if available.
@@ -248,13 +244,14 @@ result_t x509_write_pem(FILE *peercert_file, openvpn_x509_cert_t *peercert);
  *
  * @param crl_file	File name of the CRL file
  * @param cert		Certificate to verify
+ * @param crl_inline	Contents of the crl file if it is inlined
  * @param subject	Subject of the given certificate
  *
  * @return 		\c SUCCESS if the CRL was not signed by the issuer of the
  * 			certificate or does not contain an entry for it.
  * 			\c FAILURE otherwise.
  */
-result_t x509_verify_crl(const char *crl_file, openvpn_x509_cert_t *cert,
-    const char *subject);
+result_t x509_verify_crl(const char *crl_file, const char *crl_inline,
+                         openvpn_x509_cert_t *cert, const char *subject);
 
 #endif /* SSL_VERIFY_BACKEND_H_ */

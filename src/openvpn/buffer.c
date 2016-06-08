@@ -254,7 +254,7 @@ buf_puts(struct buffer *buf, const char *str)
  *
  * Return false on overflow.
  *
- * This function is duplicated into service-win32/openvpnserv.c
+ * This functionality is duplicated in src/openvpnserv/common.c
  * Any modifications here should be done to the other place as well.
  */
 
@@ -435,18 +435,21 @@ gc_transfer (struct gc_arena *dest, struct gc_arena *src)
 
 char *
 format_hex_ex (const uint8_t *data, int size, int maxoutput,
-	       int space_break, const char* separator,
+	       unsigned int space_break_flags, const char* separator,
 	       struct gc_arena *gc)
 {
   struct buffer out = alloc_buf_gc (maxoutput ? maxoutput :
-				    ((size * 2) + (size / space_break) * (int) strlen (separator) + 2),
+				    ((size * 2) + (size / (space_break_flags & FHE_SPACE_BREAK_MASK)) * (int) strlen (separator) + 2),
 				    gc);
   int i;
   for (i = 0; i < size; ++i)
     {
-      if (separator && i && !(i % space_break))
+      if (separator && i && !(i % (space_break_flags & FHE_SPACE_BREAK_MASK)))
 	buf_printf (&out, "%s", separator);
-      buf_printf (&out, "%02x", data[i]);
+      if (space_break_flags & FHE_CAPS)
+	buf_printf (&out, "%02X", data[i]);
+      else
+	buf_printf (&out, "%02x", data[i]);
     }
   buf_catrunc (&out, "[more...]");
   return (char *)out.data;

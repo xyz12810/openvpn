@@ -86,6 +86,30 @@
  * <tt>   [ HMAC ] [ - IV - ] [ * packet payload * ] </tt>
  *
  * @par
+ * <b>GCM data channel crypto format</b> \n
+ * GCM modes are only supported in TLS mode.  In these modes, the IV consists of
+ * the 32-bit packet counter followed by data from the HMAC key.  The HMAC key
+ * can be used as IV, since in GCM and CCM modes the HMAC key is not used for
+ * the HMAC.  The packet counter may not roll over within a single TLS sessions.
+ * This results in a unique IV for each packet, as required by GCM.
+ *
+ * @par
+ * The HMAC key data is pre-shared during the connection setup, and thus can be
+ * omitted in on-the-wire packets, saving 8 bytes per packet (for GCM and CCM).
+ *
+ * @par
+ * In GCM mode, P_DATA_V2 headers (the opcode and peer-id) are also
+ * authenticated as Additional Data.
+ *
+ * @par
+ * <i>GCM IV format:</i> \n
+ * <tt>   [ - packet ID - ] [ - HMAC key data - ] </tt>\n
+ * <i>P_DATA_V1 GCM data channel crypto format:</i> \n
+ * <tt>   [ opcode ] [ - packet ID - ] [ TAG ] [ * packet payload * ] </tt>
+ * <i>P_DATA_V2 GCM data channel crypto format:</i> \n
+ * <tt>   [ - opcode/peer-id - ] [ - packet ID - ] [ TAG ] [ * packet payload * ] </tt>
+ *
+ * @par
  * <b>No-crypto data channel format</b> \n
  * In no-crypto mode (\c \-\-cipher \c none is specified), both TLS-mode and
  * static key mode are supported. No encryption will be performed on the packet,
@@ -138,13 +162,16 @@ struct key
 
 
 /**
- * Container for one set of OpenSSL cipher and/or HMAC contexts.
+ * Container for one set of cipher and/or HMAC contexts.
  * @ingroup control_processor
  */
 struct key_ctx
 {
   cipher_ctx_t *cipher;      	/**< Generic cipher %context. */
-  hmac_ctx_t *hmac;               /**< Generic HMAC %context. */
+  hmac_ctx_t *hmac;             /**< Generic HMAC %context. */
+  uint8_t implicit_iv[OPENVPN_MAX_IV_LENGTH];
+				/**< The implicit part of the IV */
+  size_t implicit_iv_len;       /**< The length of implicit_iv */
 };
 
 #define KEY_DIRECTION_BIDIRECTIONAL 0 /* same keys for both directions */
@@ -195,10 +222,10 @@ struct key_direction_state
  */
 struct key_ctx_bi
 {
-  struct key_ctx encrypt;       /**< OpenSSL cipher and/or HMAC contexts
-                                 *   for sending direction. */
-  struct key_ctx decrypt;       /**< OpenSSL cipher and/or HMAC contexts
-                                 *   for receiving direction. */
+  struct key_ctx encrypt;       /**< Cipher and/or HMAC contexts for sending
+				 *   direction. */
+  struct key_ctx decrypt;       /**< cipher and/or HMAC contexts for
+                                 *   receiving direction. */
 };
 
 /**
@@ -207,11 +234,11 @@ struct key_ctx_bi
  */
 struct crypto_options
 {
-  struct key_ctx_bi *key_ctx_bi;
+  struct key_ctx_bi key_ctx_bi;
                                 /**< OpenSSL cipher and HMAC contexts for
                                  *   both sending and receiving
                                  *   directions. */
-  struct packet_id *packet_id;  /**< Current packet ID state for both
+  struct packet_id packet_id;   /**< Current packet ID state for both
                                  *   sending and receiving directions. */
   struct packet_id_persist *pid_persist;
                                 /**< Persistent packet ID state for
@@ -237,6 +264,12 @@ struct crypto_options
   unsigned int flags;           /**< Bit-flags determining behavior of
                                  *   security operation functions. */
 };
+
+/**
+ * Minimal IV length for AEAD mode ciphers (in bytes):
+ * 4-byte packet id + 8 bytes implicit IV.
+ */
+#define OPENVPN_AEAD_MIN_IV_LEN (sizeof (packet_id_type) + 8)
 
 #define RKF_MUST_SUCCEED (1<<0)
 #define RKF_INLINE       (1<<1)
@@ -264,7 +297,7 @@ int read_key (struct key *key, const struct key_type *kt, struct buffer *buf);
 
 void init_key_type (struct key_type *kt, const char *ciphername,
     bool ciphername_defined, const char *authname, bool authname_defined,
-    int keysize, bool cfb_ofb_allowed, bool warn);
+    int keysize, bool tls_mode, bool warn);
 
 /*
  * Key context functions
@@ -301,18 +334,16 @@ void free_key_ctx_bi (struct key_ctx_bi *ctx);
  *
  * @param buf          - The %buffer containing the packet on which to
  *                       perform security operations.
- * @param work         - A working %buffer.
+ * @param work         - An initialized working %buffer.
  * @param opt          - The security parameter state for this VPN tunnel.
- * @param frame        - The packet geometry parameters for this VPN
- *                       tunnel.
+ *
  * @return This function returns void.\n On return, the \a buf argument
  *     will point to the resulting %buffer.  This %buffer will either
  *     contain the processed packet ready for sending, or be empty if an
  *     error occurred.
  */
 void openvpn_encrypt (struct buffer *buf, struct buffer work,
-		      const struct crypto_options *opt,
-		      const struct frame* frame);
+		      struct crypto_options *opt);
 
 
 /**
@@ -338,6 +369,8 @@ void openvpn_encrypt (struct buffer *buf, struct buffer work,
  * @param opt          - The security parameter state for this VPN tunnel.
  * @param frame        - The packet geometry parameters for this VPN
  *                       tunnel.
+ * @param ad_start     - A pointer into buf, indicating from where to start
+ *                       authenticating additional data (AEAD mode only).
  *
  * @return
  * @li True, if the packet was authenticated and decrypted successfully.
@@ -347,8 +380,8 @@ void openvpn_encrypt (struct buffer *buf, struct buffer work,
  *     an error occurred.
  */
 bool openvpn_decrypt (struct buffer *buf, struct buffer work,
-		      const struct crypto_options *opt,
-		      const struct frame* frame);
+		      struct crypto_options *opt, const struct frame* frame,
+		      const uint8_t *ad_start);
 
 /** @} name Functions for performing security operations on data channel packets */
 
@@ -397,7 +430,7 @@ void prng_bytes (uint8_t *output, int len);
 
 void prng_uninit ();
 
-void test_crypto (const struct crypto_options *co, struct frame* f);
+void test_crypto (struct crypto_options *co, struct frame* f);
 
 
 /* key direction functions */

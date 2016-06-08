@@ -28,6 +28,11 @@
 #include "config-msvc.h"
 #endif
 
+#ifdef HAVE_SYS_INOTIFY_H
+#include <sys/inotify.h>
+#define INOTIFY_EVENT_BUFFER_SIZE 16384
+#endif
+
 #include "syshead.h"
 
 #if P2MP_SERVER
@@ -243,6 +248,23 @@ cid_compare_function (const void *key1, const void *key2)
 
 #endif
 
+#ifdef ENABLE_ASYNC_PUSH
+static uint32_t
+/*
+ * inotify watcher descriptors are used as hash value
+ */
+int_hash_function (const void *key, uint32_t iv)
+{
+  return (unsigned long)key;
+}
+
+static bool
+int_compare_function (const void *key1, const void *key2)
+{
+  return (unsigned long)key1 == (unsigned long)key2;
+}
+#endif
+
 /*
  * Main initialization function, init multi_context object.
  */
@@ -302,6 +324,17 @@ multi_init (struct multi_context *m, struct context *t, bool tcp_mode, int threa
 			   0,
 			   cid_hash_function,
 			   cid_compare_function);
+#endif
+
+#ifdef ENABLE_ASYNC_PUSH
+  /*
+   * Mapping between inotify watch descriptors and
+   * multi_instances.
+   */
+  m->inotify_watchers = hash_init (t->options.real_hash_size,
+                        get_random(),
+                        int_hash_function,
+                        int_compare_function);
 #endif
 
   /*
@@ -396,6 +429,8 @@ multi_init (struct multi_context *m, struct context *t, bool tcp_mode, int threa
         t->options.stale_routes_check_interval, t->options.stale_routes_ageing_time);
       event_timeout_init (&m->stale_routes_check_et, t->options.stale_routes_check_interval, 0);
     }
+
+  m->deferred_shutdown_signal.signal_received = 0;
 }
 
 const char *
@@ -562,6 +597,14 @@ multi_close_instance (struct multi_context *m,
 	}
 #endif
 
+#ifdef ENABLE_ASYNC_PUSH
+      if (mi->inotify_watch != -1)
+	{
+	  hash_remove(m->inotify_watchers, (void*) (unsigned long)mi->inotify_watch);
+	  mi->inotify_watch = -1;
+	}
+#endif
+
       m->instances[mi->context.c2.tls_multi->peer_id] = NULL;
 
       schedule_remove_entry (m->schedule, (struct schedule_entry *) mi);
@@ -642,6 +685,11 @@ multi_uninit (struct multi_context *m)
 
 	  free(m->instances);
 
+#ifdef ENABLE_ASYNC_PUSH
+	  hash_free (m->inotify_watchers);
+	  m->inotify_watchers = NULL;
+#endif
+
 	  schedule_free (m->schedule);
 	  mbuf_free (m->mbuf);
 	  ifconfig_pool_free (m->ifconfig_pool);
@@ -717,6 +765,11 @@ multi_create_instance (struct multi_context *m, const struct mroute_addr *real)
 #endif
 
   mi->context.c2.push_reply_deferred = true;
+
+#ifdef ENABLE_ASYNC_PUSH
+  mi->context.c2.push_request_received = false;
+  mi->inotify_watch = -1;
+#endif
 
   if (!multi_process_post (m, mi, MPP_PRE_SELECT))
     {
@@ -923,6 +976,13 @@ multi_print_status (struct multi_context *m, struct status_output *so, const int
       status_flush (so);
       gc_free (&gc_top);
     }
+
+#ifdef ENABLE_ASYNC_PUSH
+  if (m->inotify_watchers)
+  {
+    msg (D_MULTI_DEBUG, "inotify watchers count: %d\n", hash_n_elements(m->inotify_watchers));
+  }
+#endif
 }
 
 /*
@@ -1371,10 +1431,10 @@ multi_select_virtual_addr (struct multi_context *m, struct multi_instance *mi)
 	  if ( mi->context.options.ifconfig_ipv6_pool_defined )
 	    {
 	      mi->context.c2.push_ifconfig_ipv6_local = remote_ipv6;
-	      mi->context.c2.push_ifconfig_ipv6_remote = 
+	      mi->context.c2.push_ifconfig_ipv6_remote =
 		    mi->context.c1.tuntap->local_ipv6;
-	      mi->context.c2.push_ifconfig_ipv6_netbits = 
-		    mi->context.options.ifconfig_ipv6_pool_netbits;
+	      mi->context.c2.push_ifconfig_ipv6_netbits =
+		    mi->context.options.ifconfig_ipv6_netbits;
 	      mi->context.c2.push_ifconfig_ipv6_defined = true;
 	    }
 	}
@@ -1446,10 +1506,24 @@ multi_set_virtual_addr_env (struct multi_context *m, struct multi_instance *mi)
 	}
     }
 
-    /* TODO: I'm not exactly sure what these environment variables are
-     *       used for, but if we have them for IPv4, we should also have
-     *       them for IPv6, no?
-     */
+  setenv_del (mi->context.c2.es, "ifconfig_pool_local_ip6");
+  setenv_del (mi->context.c2.es, "ifconfig_pool_remote_ip6");
+  setenv_del (mi->context.c2.es, "ifconfig_pool_ip6_netbits");
+
+  if (mi->context.c1.tuntap->ipv6 && mi->context.c2.push_ifconfig_ipv6_defined)
+    {
+      setenv_in6_addr (mi->context.c2.es,
+                       "ifconfig_pool_remote",
+                       &mi->context.c2.push_ifconfig_ipv6_local,
+                       SA_SET_IF_NONZERO);
+      setenv_in6_addr (mi->context.c2.es,
+                       "ifconfig_pool_local",
+                       &mi->context.c2.push_ifconfig_ipv6_remote,
+                       SA_SET_IF_NONZERO);
+      setenv_int (mi->context.c2.es,
+                  "ifconfig_pool_ip6_netbits",
+                  mi->context.c2.push_ifconfig_ipv6_netbits);
+    }
 }
 
 /*
@@ -1800,6 +1874,7 @@ multi_connection_established (struct multi_context *m, struct multi_instance *mi
 	{
 	  msg (D_MULTI_ERRORS, "MULTI: client has been rejected due to 'disable' directive");
 	  cc_succeeded = false;
+	  cc_succeeded_count = 0;
 	}
 
       if (cc_succeeded)
@@ -1877,6 +1952,14 @@ multi_connection_established (struct multi_context *m, struct multi_instance *mi
 
 	  /* set context-level authentication flag */
 	  mi->context.c2.context_auth = CAS_SUCCEEDED;
+
+#ifdef ENABLE_ASYNC_PUSH
+	  /* authentication complete, send push reply */
+	  if (mi->context.c2.push_request_received)
+	    {
+	      process_incoming_push_request(&mi->context);
+	    }
+#endif
 	}
       else
 	{
@@ -1905,6 +1988,58 @@ multi_connection_established (struct multi_context *m, struct multi_instance *mi
    */
   mi->context.c2.push_reply_deferred = false;
 }
+
+#ifdef ENABLE_ASYNC_PUSH
+/*
+ * Called when inotify event is fired, which happens when acf file is closed or deleted.
+ * Continues authentication and sends push_reply.
+ */
+void
+multi_process_file_closed (struct multi_context *m, const unsigned int mpp_flags)
+{
+  char buffer[INOTIFY_EVENT_BUFFER_SIZE];
+  size_t buffer_i = 0;
+  int r = read (m->top.c2.inotify_fd, buffer, INOTIFY_EVENT_BUFFER_SIZE);
+
+  while (buffer_i < r)
+    {
+      /* parse inotify events */
+      struct inotify_event *pevent = (struct inotify_event *) &buffer[buffer_i];
+      size_t event_size = sizeof (struct inotify_event) + pevent->len;
+      buffer_i += event_size;
+
+      msg(D_MULTI_DEBUG, "MULTI: modified fd %d, mask %d", pevent->wd, pevent->mask);
+
+      struct multi_instance* mi = hash_lookup(m->inotify_watchers, (void*) (unsigned long) pevent->wd);
+
+      if (pevent->mask & IN_CLOSE_WRITE)
+	{
+	  if (mi)
+	    {
+	      /* continue authentication and send push_reply */
+	      multi_process_post (m, mi, mpp_flags);
+	    }
+	  else
+	    {
+	      msg(D_MULTI_ERRORS, "MULTI: multi_instance not found!");
+	    }
+	}
+      else if (pevent->mask & IN_IGNORED)
+	{
+	  /* this event is _always_ fired when watch is removed or file is deleted */
+	  if (mi)
+	    {
+	      hash_remove(m->inotify_watchers, (void*) (unsigned long) pevent->wd);
+	      mi->inotify_watch = -1;
+	    }
+	}
+      else
+	{
+	  msg(D_MULTI_ERRORS, "MULTI: unknown mask %d", pevent->mask);
+	}
+    }
+}
+#endif
 
 /*
  * Add a mbuf buffer to a particular
@@ -2066,19 +2201,50 @@ multi_process_post (struct multi_context *m, struct multi_instance *mi, const un
 
   if (!IS_SIG (&mi->context) && ((flags & MPP_PRE_SELECT) || ((flags & MPP_CONDITIONAL_PRE_SELECT) && !ANY_OUT (&mi->context))))
     {
+#if defined(ENABLE_ASYNC_PUSH) && defined(ENABLE_DEF_AUTH)
+      bool was_authenticated = false;
+      struct key_state *ks = NULL;
+      if (mi->context.c2.tls_multi)
+        {
+          ks = &mi->context.c2.tls_multi->session[TM_ACTIVE].key[KS_PRIMARY];
+          was_authenticated = ks->authenticated;
+        }
+#endif
+
       /* figure timeouts and fetch possible outgoing
 	 to_link packets (such as ping or TLS control) */
       pre_select (&mi->context);
 
+#if defined(ENABLE_ASYNC_PUSH) && defined(ENABLE_DEF_AUTH)
+      if (ks && ks->auth_control_file && ks->auth_deferred && !was_authenticated)
+	{
+	  /* watch acf file */
+	  long watch_descriptor = inotify_add_watch(m->top.c2.inotify_fd, ks->auth_control_file, IN_CLOSE_WRITE | IN_ONESHOT);
+	  if (watch_descriptor >= 0)
+	    {
+	      if (mi->inotify_watch != -1)
+		{
+		  hash_remove(m->inotify_watchers, (void*) (unsigned long)mi->inotify_watch);
+		}
+	      hash_add (m->inotify_watchers, (const uintptr_t*)watch_descriptor, mi, true);
+	      mi->inotify_watch = watch_descriptor;
+	    }
+	  else
+	    {
+	      msg(M_NONFATAL, "MULTI: inotify_add_watch error: %s", strerror(errno));
+	    }
+	}
+#endif
+
       if (!IS_SIG (&mi->context))
 	{
-	  /* tell scheduler to wake us up at some point in the future */
-	  multi_schedule_context_wakeup(m, mi);
-
 	  /* connection is "established" when SSL/TLS key negotiation succeeds
 	     and (if specified) auth user/pass succeeds */
 	  if (!mi->connection_established_flag && CONNECTION_ESTABLISHED (&mi->context))
 	    multi_connection_established (m, mi);
+
+	  /* tell scheduler to wake us up at some point in the future */
+	  multi_schedule_context_wakeup(m, mi);
 	}
     }
 
@@ -2137,7 +2303,7 @@ void multi_process_float (struct multi_context* m, struct multi_instance* mi)
       /* do not float if target address is taken by client with another cert */
       if (!cert_hash_compare(m1->locked_cert_hash_set, m2->locked_cert_hash_set))
 	{
-	  msg (D_MULTI_MEDIUM, "Disallow float to an address taken by another client %s",
+	  msg (D_MULTI_LOW, "Disallow float to an address taken by another client %s",
 	       multi_instance_string (ex_mi, false, &gc));
 
 	  mi->context.c2.buf.len = 0;
@@ -2572,10 +2738,18 @@ multi_process_timeout (struct multi_context *m, const unsigned int mpp_flags)
   /* instance marked for wakeup? */
   if (m->earliest_wakeup)
     {
-      set_prefix (m->earliest_wakeup);
-      ret = multi_process_post (m, m->earliest_wakeup, mpp_flags);
+      if (m->earliest_wakeup == (struct multi_instance*)&m->deferred_shutdown_signal)
+	{
+	  schedule_remove_entry(m->schedule, (struct schedule_entry*) &m->deferred_shutdown_signal);
+	  throw_signal(m->deferred_shutdown_signal.signal_received);
+	}
+      else
+	{
+	  set_prefix (m->earliest_wakeup);
+	  ret = multi_process_post (m, m->earliest_wakeup, mpp_flags);
+	  clear_prefix ();
+	}
       m->earliest_wakeup = NULL;
-      clear_prefix ();
     }
   return ret;
 }
@@ -2700,6 +2874,48 @@ multi_top_free (struct multi_context *m)
   free_context_buffers (m->top.c2.buffers);
 }
 
+static bool
+is_exit_restart(int sig)
+{
+  return (sig == SIGUSR1 || sig == SIGTERM || sig == SIGHUP || sig == SIGINT);
+}
+
+static void
+multi_push_restart_schedule_exit(struct multi_context *m, bool next_server)
+{
+  struct hash_iterator hi;
+  struct hash_element *he;
+  struct timeval tv;
+
+  /* tell all clients to restart */
+  hash_iterator_init (m->iter, &hi);
+  while ((he = hash_iterator_next (&hi)))
+    {
+      struct multi_instance *mi = (struct multi_instance *) he->value;
+      if (!mi->halt)
+        {
+	  send_control_channel_string (&mi->context, next_server ? "RESTART,[N]" : "RESTART", D_PUSH);
+	  multi_schedule_context_wakeup(m, mi);
+        }
+    }
+  hash_iterator_free (&hi);
+
+  /* reschedule signal */
+  ASSERT (!openvpn_gettimeofday (&m->deferred_shutdown_signal.wakeup, NULL));
+  tv.tv_sec = 2;
+  tv.tv_usec = 0;
+  tv_add (&m->deferred_shutdown_signal.wakeup, &tv);
+
+  m->deferred_shutdown_signal.signal_received = m->top.sig->signal_received;
+
+  schedule_add_entry (m->schedule,
+		      (struct schedule_entry *) &m->deferred_shutdown_signal,
+		      &m->deferred_shutdown_signal.wakeup,
+		      compute_wakeup_sigma (&m->deferred_shutdown_signal.wakeup));
+
+  m->top.sig->signal_received = 0;
+}
+
 /*
  * Return true if event loop should break,
  * false if it should continue.
@@ -2713,6 +2929,14 @@ multi_process_signal (struct multi_context *m)
       multi_print_status (m, so, m->status_file_version);
       status_close (so);
       m->top.sig->signal_received = 0;
+      return false;
+    }
+  else if (proto_is_dgram(m->top.options.ce.proto) &&
+      is_exit_restart(m->top.sig->signal_received) &&
+      (m->deferred_shutdown_signal.signal_received == 0) &&
+      m->top.options.ce.explicit_exit_notification != 0)
+    {
+      multi_push_restart_schedule_exit(m, m->top.options.ce.explicit_exit_notification == 2);
       return false;
     }
   return true;

@@ -66,12 +66,6 @@ AC_ARG_ENABLE(
 	[enable_lzo="yes"]
 )
 
-AC_ARG_ENABLE(snappy,
-	[  --disable-snappy        Disable Snappy compression support],
-	[enable_snappy="$enableval"],
-	[enable_snappy="yes"]
-)
-
 AC_ARG_ENABLE(lz4,
 	[  --disable-lz4           Disable LZ4 compression support],
 	[enable_lz4="$enableval"],
@@ -176,13 +170,6 @@ AC_ARG_ENABLE(
 )
 
 AC_ARG_ENABLE(
-	[password-save],
-	[AS_HELP_STRING([--enable-password-save], [allow --askpass and --auth-user-pass passwords to be read from a file @<:@default=no@:>@])],
-	,
-	[enable_password_save="no"]
-)
-
-AC_ARG_ENABLE(
 	[iproute2],
 	[AS_HELP_STRING([--enable-iproute2], [enable support for iproute2 @<:@default=no@:>@])],
 	,
@@ -277,6 +264,13 @@ AC_ARG_ENABLE(
 	[enable_systemd="no"]
 )
 
+AC_ARG_ENABLE(
+	[async-push],
+	[AS_HELP_STRING([--enable-async-push], [enable async-push support @<:@default=no@:>@])],
+	[enable_async_push="yes"],
+	[enable_async_push="no"]
+)
+
 AC_ARG_WITH(
 	[special-build],
 	[AS_HELP_STRING([--with-special-build=STRING], [specify special build string])],
@@ -297,10 +291,10 @@ AC_ARG_WITH(
 
 AC_ARG_WITH(
 	[crypto-library],
-	[AS_HELP_STRING([--with-crypto-library=library], [build with the given crypto library, TYPE=openssl|polarssl @<:@default=openssl@:>@])],
+	[AS_HELP_STRING([--with-crypto-library=library], [build with the given crypto library, TYPE=openssl|mbedtls @<:@default=openssl@:>@])],
 	[
-		case "${withval}" in 
-			openssl|polarssl) ;;
+		case "${withval}" in
+			openssl|mbedtls) ;;
 			*) AC_MSG_ERROR([bad value ${withval} for --with-crypto-library]) ;;
 		esac
 	],
@@ -348,7 +342,7 @@ case "$host" in
 		AC_DEFINE([TARGET_WIN32], [1], [Are we running WIN32?])
 		AC_DEFINE_UNQUOTED([TARGET_PREFIX], ["W"], [Target prefix])
 		CPPFLAGS="${CPPFLAGS} -DWIN32_LEAN_AND_MEAN"
-		CPPFLAGS="${CPPFLAGS} -DNTDDI_VERSION=NTDDI_WINXP -D_WIN32_WINNT=_WIN32_WINNT_WINXP"
+		CPPFLAGS="${CPPFLAGS} -DNTDDI_VERSION=NTDDI_VISTA -D_WIN32_WINNT=_WIN32_WINNT_VISTA"
 		WIN32=yes
 		;;
 	*-*-dragonfly*)
@@ -440,6 +434,7 @@ AC_CHECK_HEADERS([ \
 	netinet/in.h netinet/in_systm.h \
 	netinet/tcp.h arpa/inet.h netdb.h \
 	windows.h winsock2.h ws2tcpip.h \
+	versionhelpers.h \
 ])
 AC_CHECK_HEADERS([ \
 	sys/time.h sys/ioctl.h sys/stat.h \
@@ -632,7 +627,7 @@ AC_SUBST([SOCKETS_LIBS])
 
 old_LIBS="${LIBS}"
 LIBS="${LIBS} ${SOCKETS_LIBS}"
-AC_CHECK_FUNCS([sendmsg recvmsg inet_ntop inet_pton])
+AC_CHECK_FUNCS([sendmsg recvmsg])
 # Windows use stdcall for winsock so we cannot auto detect these
 m4_define(
 	[SOCKET_FUNCS],
@@ -644,6 +639,27 @@ m4_define(
 	[setsockopt getsockopt getsockname poll]dnl
 )
 if test "${WIN32}" = "yes"; then
+# normal autoconf function checking does not find inet_ntop/inet_pton
+# because they need to include the actual header file and link ws2_32.dll
+	LIBS="${LIBS} -lws2_32"
+	AC_MSG_CHECKING([for MinGW inet_ntop()/inet_pton()])
+	AC_LINK_IFELSE(
+		[AC_LANG_PROGRAM(
+			[[
+#include <ws2tcpip.h>
+			]],
+			[[
+int r = (int) inet_ntop (0, NULL, NULL, 0);
+    r += inet_pton(AF_INET, NULL, NULL);
+return r;
+			]]
+		)],
+		[AC_MSG_RESULT([OK])
+		 AC_DEFINE([HAVE_INET_NTOP],[1],[MinGW inet_ntop])
+		 AC_DEFINE([HAVE_INET_PTON],[1],[MinGW inet_pton])
+		],
+		[AC_MSG_RESULT([not found])]
+	)
 	m4_foreach(
 		[F],
 		m4_split(SOCKET_FUNCS SOCKET_OPT_FUNCS),
@@ -651,6 +667,7 @@ if test "${WIN32}" = "yes"; then
 			AC_DEFINE([UF], [1], [Win32 builtin])
 	)
 else
+	AC_CHECK_FUNCS([inet_ntop inet_pton])
 	AC_CHECK_FUNCS(
 		SOCKET_FUNCS,
 		,
@@ -764,42 +781,32 @@ PKG_CHECK_MODULES(
 	[]
 )
 
-PKG_CHECK_MODULES(
-	[OPENSSL_CRYPTO],
-	[libcrypto >= 0.9.8],
-	[have_openssl_crypto="yes"],
-	[AC_CHECK_LIB(
-		[crypto],
-		[RSA_new],
-		[
-			have_openssl_crypto="yes"
-			OPENSSL_CRYPTO_LIBS="-lcrypto"
-		]
-	)]
-)
+if test "${with_crypto_library}" = "openssl"; then
+	AC_ARG_VAR([OPENSSL_CFLAGS], [C compiler flags for OpenSSL])
+	AC_ARG_VAR([OPENSSL_LIBS], [linker flags for OpenSSL])
 
-PKG_CHECK_MODULES(
-	[OPENSSL_SSL],
-	[libssl >= 0.9.8],
-	[have_openssl_ssl="yes"],
-	[AC_CHECK_LIB(
-		[ssl],
-		[SSL_CTX_new],
-		[
-			have_openssl_ssl="yes"
-			OPENSSL_SSL_LIBS="-lssl"
-		],
-		[],
-		[-lcrypto]
-	)]
-)
+	if test -z "${OPENSSL_CFLAGS}" -a -z "${OPENSSL_LIBS}"; then
+		# if the user did not explicitly specify flags, try to autodetect
+		PKG_CHECK_MODULES(
+			[OPENSSL],
+			[libcrypto >= 0.9.8, libssl >= 0.9.8],
+	        [have_openssl="yes"],
+			[have_openssl="no"] # Provide if-not-found to prevent erroring out
+		)
 
-if test "${have_openssl_crypto}" = "yes"; then
+		OPENSSL_LIBS=${OPENSSL_LIBS:--lssl -lcrypto}
+	fi
+
 	saved_CFLAGS="${CFLAGS}"
 	saved_LIBS="${LIBS}"
-	CFLAGS="${CFLAGS} ${OPENSSL_CRYPTO_CFLAGS}"
-	LIBS="${LIBS} ${OPENSSL_CRYPTO_LIBS}"
-	AC_CHECK_FUNCS([EVP_CIPHER_CTX_set_key_length])
+	CFLAGS="${CFLAGS} ${OPENSSL_CFLAGS}"
+	LIBS="${LIBS} ${OPENSSL_LIBS}"
+
+	AC_CHECK_FUNCS([SSL_CTX_new EVP_CIPHER_CTX_set_key_length],
+				   ,
+				   [AC_MSG_ERROR([openssl check failed])]
+	)
+
 	have_openssl_engine="yes"
 	AC_CHECK_FUNCS(
 		[ \
@@ -810,83 +817,109 @@ if test "${have_openssl_crypto}" = "yes"; then
 		,
 		[have_openssl_engine="no"; break]
 	)
+	if test "${have_openssl_engine}" = "yes"; then
+		AC_DEFINE([HAVE_OPENSSL_ENGINE], [1], [OpenSSL engine support available])
+	fi
+
+	have_crypto_aead_modes="yes"
+	AC_CHECK_FUNCS(
+		[EVP_aes_256_gcm],
+		,
+		[have_crypto_aead_modes="no"; break]
+	)
 
 	CFLAGS="${saved_CFLAGS}"
 	LIBS="${saved_LIBS}"
-fi
 
-AC_ARG_VAR([POLARSSL_CFLAGS], [C compiler flags for polarssl])
-AC_ARG_VAR([POLARSSL_LIBS], [linker flags for polarssl])
-have_polarssl_ssl="yes"
-have_polarssl_crypto="yes"
-if test -z "${POLARSSL_LIBS}"; then
-	AC_CHECK_LIB(
-		[polarssl],
-		[ssl_init],
-		[POLARSSL_LIBS="-lpolarssl"],
-		[
-			have_polarssl_ssl="no"
-			AC_CHECK_LIB(
-				[polarssl],
-				[aes_crypt_cbc],
-				,
-				[have_polarssl_crypto="no"],
-				[${PKCS11_HELPER_LIBS}]
-			)
-		],
-		[${PKCS11_HELPER_LIBS}]
-	)
-fi
+	have_crypto="yes"
+	AC_DEFINE([ENABLE_CRYPTO_OPENSSL], [1], [Use OpenSSL library])
+	CRYPTO_CFLAGS="${OPENSSL_CFLAGS}"
+	CRYPTO_LIBS="${OPENSSL_LIBS}"
+elif test "${with_crypto_library}" = "mbedtls"; then
+	AC_ARG_VAR([MBEDTLS_CFLAGS], [C compiler flags for mbedtls])
+	AC_ARG_VAR([MBEDTLS_LIBS], [linker flags for mbedtls])
 
-if test "${with_crypto_library}" = "polarssl" ; then
-	AC_MSG_CHECKING([polarssl version])
-	old_CFLAGS="${CFLAGS}"
-	CFLAGS="${POLARSSL_CFLAGS} ${CFLAGS}"
+	saved_CFLAGS="${CFLAGS}"
+	saved_LIBS="${LIBS}"
+
+	if test -z "${MBEDTLS_CFLAGS}" -a -z "${MBEDTLS_LIBS}"; then
+		# if the user did not explicitly specify flags, try to autodetect
+		LIBS="${LIBS} -lmbedtls -lmbedx509 -lmbedcrypto"
+		AC_CHECK_LIB(
+			[mbedtls],
+			[mbedtls_ssl_init],
+			[MBEDTLS_LIBS="-lmbedtls -lmbedx509 -lmbedcrypto"],
+			[AC_MSG_ERROR([Could not find mbed TLS.])],
+			[${PKCS11_HELPER_LIBS}]
+		)
+	fi
+
+	CFLAGS="${MBEDTLS_CFLAGS} ${PKCS11_HELPER_CFLAGS} ${CFLAGS}"
+	LIBS="${MBEDTLS_LIBS} ${PKCS11_HELPER_LIBS} ${LIBS}"
+
+	AC_MSG_CHECKING([mbedtls version])
 	AC_COMPILE_IFELSE(
 		[AC_LANG_PROGRAM(
 			[[
-#include <polarssl/version.h>
+#include <mbedtls/version.h>
 			]],
 			[[
-#if POLARSSL_VERSION_NUMBER < 0x01030300 || POLARSSL_VERSION_NUMBER >= 0x01040000
+#if MBEDTLS_VERSION_NUMBER < 0x02000000 || MBEDTLS_VERSION_NUMBER >= 0x03000000
 #error invalid version
 #endif
 			]]
 		)],
 		[AC_MSG_RESULT([ok])],
-		[AC_MSG_ERROR([PolarSSL 1.3.x required and must be 1.3.3 or later])]
+		[AC_MSG_ERROR([mbed TLS 2.y.z required])]
 	)
 
-	polarssl_with_pkcs11="no"
+	mbedtls_with_pkcs11="no"
 	AC_COMPILE_IFELSE(
 		[AC_LANG_PROGRAM(
 			[[
-#include <polarssl/config.h>
+#include <mbedtls/config.h>
 			]],
 			[[
-#ifndef POLARSSL_PKCS11_C
+#ifndef MBEDTLS_PKCS11_C
 #error pkcs11 wrapper missing
 #endif
 			]]
 		)],
-		polarssl_with_pkcs11="yes")
-	CFLAGS="${old_CFLAGS}"
+		mbedtls_with_pkcs11="yes")
 
-	AC_MSG_CHECKING([polarssl pkcs11 support])
+	AC_MSG_CHECKING([mbedtls pkcs11 support])
 	if test "${enable_pkcs11}" = "yes"; then
-		if test "${polarssl_with_pkcs11}" = "yes"; then
+		if test "${mbedtls_with_pkcs11}" = "yes"; then
 			AC_MSG_RESULT([ok])
 		else
-			AC_MSG_ERROR([polarssl has no pkcs11 wrapper compiled in])
+			AC_MSG_ERROR([mbedtls has no pkcs11 wrapper compiled in])
 		fi
 	else
-		if test "${polarssl_with_pkcs11}" != "yes"; then
+		if test "${mbedtls_with_pkcs11}" != "yes"; then
 			AC_MSG_RESULT([ok])
 		else
-			AC_MSG_ERROR([PolarSSL compiled with PKCS11, while OpenVPN is not])
+			AC_MSG_ERROR([mbed TLS compiled with PKCS11, while OpenVPN is not])
 		fi
 	fi
 
+	have_crypto_aead_modes="yes"
+	AC_CHECK_FUNCS(
+		[ \
+			mbedtls_cipher_write_tag \
+			mbedtls_cipher_check_tag \
+		],
+		,
+		[have_crypto_aead_modes="no"; break]
+	)
+
+	CFLAGS="${saved_CFLAGS}"
+	LIBS="${saved_LIBS}"
+	have_crypto="yes"
+	AC_DEFINE([ENABLE_CRYPTO_MBEDTLS], [1], [Use mbed TLS library])
+	CRYPTO_CFLAGS="${MBEDTLS_CFLAGS}"
+	CRYPTO_LIBS="${MBEDTLS_LIBS}"
+else
+	AC_MSG_ERROR([Invalid crypto library: ${with_crypto_library}])
 fi
 
 AC_ARG_VAR([LZO_CFLAGS], [C compiler flags for lzo])
@@ -927,45 +960,6 @@ if test "${have_lzo}" = "yes"; then
 		)]
 	)
 	CFLAGS="${saved_CFLAGS}"
-fi
-
-dnl
-dnl check for Snappy library
-dnl
-
-AC_ARG_VAR([SNAPPY_CFLAGS], [C compiler flags for snappy])
-AC_ARG_VAR([SNAPPY_LIBS], [linker flags for snappy])
-if test "$enable_snappy" = "yes" && test "$enable_comp_stub" = "no"; then
-    AC_CHECKING([for Snappy Library and Header files])
-    havesnappylib=1
-
-    # if SNAPPY_LIBS is set, we assume it will work, otherwise test
-    if test -z "${SNAPPY_LIBS}"; then
-	AC_CHECK_LIB(snappy, snappy_compress,
-	    [ SNAPPY_LIBS="-lsnappy" ],
-	    [
-	        AC_MSG_RESULT([Snappy library not found.])
-	        havesnappylib=0
-	    ])
-    fi
-
-    saved_CFLAGS="${CFLAGS}"
-    CFLAGS="${CFLAGS} ${SNAPPY_CFLAGS}"
-    AC_CHECK_HEADERS(snappy-c.h,
-       ,
-       [
-	   AC_MSG_RESULT([Snappy headers not found.])
-	   havesnappylib=0
-       ])
-
-    if test $havesnappylib = 0 ; then
-	AC_MSG_RESULT([Snappy library available from http://code.google.com/p/snappy/])
-        AC_MSG_ERROR([Or try ./configure --disable-snappy OR ./configure --enable-comp-stub])
-    fi
-    OPTIONAL_SNAPPY_CFLAGS="${SNAPPY_CFLAGS}"
-    OPTIONAL_SNAPPY_LIBS="${SNAPPY_LIBS}"
-    AC_DEFINE(ENABLE_SNAPPY, 1, [Enable Snappy compression library])
-    CFLAGS="${saved_CFLAGS}"
 fi
 
 dnl
@@ -1051,8 +1045,8 @@ fi
 
 dnl enable --x509-username-field feature if requested
 if test "${enable_x509_alt_username}" = "yes"; then
-	if test "${with_crypto_library}" = "polarssl" ; then
-		AC_MSG_ERROR([PolarSSL does not support the --x509-username-field feature])
+	if test "${with_crypto_library}" = "mbedtls" ; then
+		AC_MSG_ERROR([mbed TLS does not support the --x509-username-field feature])
 	fi
 
 	AC_DEFINE([ENABLE_X509ALTUSERNAME], [1], [Enable --x509-username-field feature])
@@ -1070,33 +1064,13 @@ test "${enable_port_share}" = "yes" && AC_DEFINE([ENABLE_PORT_SHARE], [1], [Enab
 test "${enable_def_auth}" = "yes" && AC_DEFINE([ENABLE_DEF_AUTH], [1], [Enable deferred authentication])
 test "${enable_pf}" = "yes" && AC_DEFINE([ENABLE_PF], [1], [Enable internal packet filter])
 test "${enable_strict_options}" = "yes" && AC_DEFINE([ENABLE_STRICT_OPTIONS_CHECK], [1], [Enable strict options check between peers])
-test "${enable_password_save}" = "yes" && AC_DEFINE([ENABLE_PASSWORD_SAVE], [1], [Allow --askpass and --auth-user-pass passwords to be read from a file])
-
-case "${with_crypto_library}" in
-	openssl)
-		have_crypto_crypto="${have_openssl_crypto}"
-		have_crypto_ssl="${have_openssl_ssl}"
-		CRYPTO_CRYPTO_CFLAGS="${OPENSSL_CRYPTO_CFLAGS}"
-		CRYPTO_CRYPTO_LIBS="${OPENSSL_CRYPTO_LIBS}"
-		CRYPTO_SSL_CFLAGS="${OPENSSL_SSL_CFLAGS}"
-		CRYPTO_SSL_LIBS="${OPENSSL_SSL_LIBS}"
-		AC_DEFINE([ENABLE_CRYPTO_OPENSSL], [1], [Use OpenSSL library])
-		test "${have_openssl_engine}" = "yes" && AC_DEFINE([HAVE_OPENSSL_ENGINE], [1], [Use crypto library])
-		;;
-	polarssl)
-		have_crypto_crypto="${have_polarssl_crypto}"
-		have_crypto_ssl="${have_polarssl_ssl}"
-		CRYPTO_CRYPTO_CFLAGS="${POLARSSL_CFLAGS}"
-		CRYPTO_CRYPTO_LIBS="${POLARSSL_LIBS}"
-		AC_DEFINE([ENABLE_CRYPTO_POLARSSL], [1], [Use PolarSSL library])
-		;;
-esac
 
 if test "${enable_crypto}" = "yes"; then
-	test "${have_crypto_crypto}" != "yes" && AC_MSG_ERROR([${with_crypto_library} crypto is required but missing])
+	test "${have_crypto}" != "yes" && AC_MSG_ERROR([${with_crypto_library} crypto is required but missing])
 	test "${enable_crypto_ofb_cfb}" = "yes" && AC_DEFINE([ENABLE_OFB_CFB_MODE], [1], [Enable OFB and CFB cipher modes])
-	OPTIONAL_CRYPTO_CFLAGS="${OPTIONAL_CRYPTO_CFLAGS} ${CRYPTO_CRYPTO_CFLAGS} ${CRYPTO_SSL_CFLAGS}"
-	OPTIONAL_CRYPTO_LIBS="${OPTIONAL_CRYPTO_LIBS} ${CRYPTO_CRYPTO_LIBS} ${CRYPTO_SSL_LIBS}"
+	test "${have_crypto_aead_modes}" = "yes" && AC_DEFINE([HAVE_AEAD_CIPHER_MODES], [1], [Use crypto library])
+	OPTIONAL_CRYPTO_CFLAGS="${OPTIONAL_CRYPTO_CFLAGS} ${CRYPTO_CFLAGS}"
+	OPTIONAL_CRYPTO_LIBS="${OPTIONAL_CRYPTO_LIBS} ${CRYPTO_LIBS}"
 	AC_DEFINE([ENABLE_CRYPTO], [1], [Enable crypto library])
 fi
 
@@ -1132,7 +1106,6 @@ if test "${enable_lzo}" = "yes"; then
 fi
 if test "${enable_comp_stub}" = "yes"; then
 	test "${enable_lzo}" = "yes" && AC_MSG_ERROR([Cannot have both comp stub and lzo enabled (use --disable-lzo)])
-	test "${enable_snappy}" = "yes" && AC_MSG_ERROR([Cannot have both comp stub and snappy enabled (use --disable-snappy)])
 	test "${enable_lz4}" = "yes" && AC_MSG_ERROR([Cannot have both comp stub and LZ4 enabled (use --disable-lz4)])
 	AC_DEFINE([ENABLE_COMP_STUB], [1], [Enable compression stub capability])
 fi
@@ -1179,6 +1152,14 @@ if test "${enable_plugin_auth_pam}" = "yes"; then
 	fi
 fi
 
+if test "${enable_async_push}" = "yes"; then
+	AC_CHECK_HEADERS(
+		[sys/inotify.h],
+		AC_DEFINE([ENABLE_ASYNC_PUSH], [1], [Enable async push]),
+		AC_MSG_ERROR([inotify.h not found.])
+	)
+fi
+
 CONFIGURE_DEFINES="`set | grep '^enable_.*=' ; set | grep '^with_.*='`"
 AC_DEFINE_UNQUOTED([CONFIGURE_DEFINES], ["`echo ${CONFIGURE_DEFINES}`"], [Configuration settings])
 
@@ -1198,8 +1179,6 @@ AC_SUBST([OPTIONAL_CRYPTO_CFLAGS])
 AC_SUBST([OPTIONAL_CRYPTO_LIBS])
 AC_SUBST([OPTIONAL_LZO_CFLAGS])
 AC_SUBST([OPTIONAL_LZO_LIBS])
-AC_SUBST([OPTIONAL_SNAPPY_CFLAGS])
-AC_SUBST([OPTIONAL_SNAPPY_LIBS])
 AC_SUBST([OPTIONAL_LZ4_CFLAGS])
 AC_SUBST([OPTIONAL_LZ4_LIBS])
 AC_SUBST([OPTIONAL_SYSTEMD_LIBS])
@@ -1219,6 +1198,35 @@ sampledir="\$(docdir)/sample"
 AC_SUBST([plugindir])
 AC_SUBST([sampledir])
 
+VENDOR_SRC_ROOT="\$(abs_top_srcdir)/vendor/"
+VENDOR_DIST_ROOT="\$(abs_top_builddir)/vendor/dist"
+VENDOR_BUILD_ROOT="\$(abs_top_builddir)/vendor/.build"
+AC_SUBST([VENDOR_SRC_ROOT])
+AC_SUBST([VENDOR_BUILD_ROOT])
+AC_SUBST([VENDOR_DIST_ROOT])
+
+TEST_LDFLAGS="-lcmocka -L\$(abs_top_builddir)/vendor/dist/lib -Wl,-rpath,\$(abs_top_builddir)/vendor/dist/lib"
+TEST_CFLAGS="-I\$(top_srcdir)/include -I\$(abs_top_builddir)/vendor/dist/include"
+
+AC_SUBST([TEST_LDFLAGS])
+AC_SUBST([TEST_CFLAGS])
+
+# Check if cmake is available and cmocka git submodule is initialized,
+# needed for unit testing
+AC_CHECK_PROGS([CMAKE], [cmake])
+if test -n "${CMAKE}"; then
+   if test -f vendor/cmocka/CMakeLists.txt; then
+      AM_CONDITIONAL([CMOCKA_INITIALIZED], [true])
+   else
+      AM_CONDITIONAL([CMOCKA_INITIALIZED], [false])
+      AC_MSG_RESULT([!! WARNING !! The cmoka git submodule has not been initialized or updated.  Unit testing cannot be performed.])
+   fi
+else
+   AC_MSG_RESULT([!! WARNING !! CMake is NOT available.  Unit testing cannot be performed.])
+   AM_CONDITIONAL([CMOCKA_INITIALIZED], [false])
+fi
+
+
 AC_CONFIG_FILES([
 	version.sh
 	Makefile
@@ -1237,6 +1245,11 @@ AC_CONFIG_FILES([
 	src/plugins/auth-pam/Makefile
 	src/plugins/down-root/Makefile
 	tests/Makefile
+        tests/unit_tests/Makefile
+        tests/unit_tests/plugins/Makefile
+        tests/unit_tests/plugins/auth-pam/Makefile
+        tests/unit_tests/example_test/Makefile
+        vendor/Makefile
 	sample/Makefile
 	doc/Makefile
 ])

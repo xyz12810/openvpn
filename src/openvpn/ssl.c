@@ -42,6 +42,7 @@
 #endif
 
 #include "syshead.h"
+#include "win32.h"
 
 #if defined(ENABLE_CRYPTO)
 
@@ -145,6 +146,7 @@ static const tls_cipher_name_pair tls_cipher_name_translation_table[] = {
     {"DHE-RSA-CAMELLIA128-SHA", "TLS-DHE-RSA-WITH-CAMELLIA-128-CBC-SHA"},
     {"DHE-RSA-CAMELLIA256-SHA256", "TLS-DHE-RSA-WITH-CAMELLIA-256-CBC-SHA256"},
     {"DHE-RSA-CAMELLIA256-SHA", "TLS-DHE-RSA-WITH-CAMELLIA-256-CBC-SHA"},
+    {"DHE-RSA-CHACHA20-POLY1305", "TLS-DHE-RSA-WITH-CHACHA20-POLY1305-SHA256"},
     {"DHE-RSA-SEED-SHA", "TLS-DHE-RSA-WITH-SEED-CBC-SHA"},
     {"DH-RSA-SEED-SHA", "TLS-DH-RSA-WITH-SEED-CBC-SHA"},
     {"ECDH-ECDSA-AES128-GCM-SHA256", "TLS-ECDH-ECDSA-WITH-AES-128-GCM-SHA256"},
@@ -173,6 +175,7 @@ static const tls_cipher_name_pair tls_cipher_name_translation_table[] = {
     {"ECDHE-ECDSA-CAMELLIA128-SHA", "TLS-ECDHE-ECDSA-WITH-CAMELLIA-128-CBC-SHA"},
     {"ECDHE-ECDSA-CAMELLIA256-SHA256", "TLS-ECDHE-ECDSA-WITH-CAMELLIA-256-CBC-SHA256"},
     {"ECDHE-ECDSA-CAMELLIA256-SHA", "TLS-ECDHE-ECDSA-WITH-CAMELLIA-256-CBC-SHA"},
+    {"ECDHE-ECDSA-CHACHA20-POLY1305", "TLS-ECDHE-ECDSA-WITH-CHACHA20-POLY1305-SHA256"},
     {"ECDHE-ECDSA-DES-CBC3-SHA", "TLS-ECDHE-ECDSA-WITH-3DES-EDE-CBC-SHA"},
     {"ECDHE-ECDSA-DES-CBC-SHA", "TLS-ECDHE-ECDSA-WITH-DES-CBC-SHA"},
     {"ECDHE-ECDSA-RC4-SHA", "TLS-ECDHE-ECDSA-WITH-RC4-128-SHA"},
@@ -188,6 +191,7 @@ static const tls_cipher_name_pair tls_cipher_name_translation_table[] = {
     {"ECDHE-RSA-CAMELLIA128-SHA", "TLS-ECDHE-RSA-WITH-CAMELLIA-128-CBC-SHA"},
     {"ECDHE-RSA-CAMELLIA256-SHA256", "TLS-ECDHE-RSA-WITH-CAMELLIA-256-CBC-SHA256"},
     {"ECDHE-RSA-CAMELLIA256-SHA", "TLS-ECDHE-RSA-WITH-CAMELLIA-256-CBC-SHA"},
+    {"ECDHE-RSA-CHACHA20-POLY1305", "TLS-ECDHE-RSA-WITH-CHACHA20-POLY1305-SHA256"},
     {"ECDHE-RSA-DES-CBC3-SHA", "TLS-ECDHE-RSA-WITH-3DES-EDE-CBC-SHA"},
     {"ECDHE-RSA-DES-CBC-SHA", "TLS-ECDHE-RSA-WITH-DES-CBC-SHA"},
     {"ECDHE-RSA-RC4-SHA", "TLS-ECDHE-RSA-WITH-RC4-128-SHA"},
@@ -232,21 +236,36 @@ static const tls_cipher_name_pair tls_cipher_name_translation_table[] = {
     {"SRP-RSA-AES-128-CBC-SHA", "TLS-SRP-SHA-RSA-WITH-AES-128-CBC-SHA"},
     {"SRP-RSA-AES-256-CBC-SHA", "TLS-SRP-SHA-RSA-WITH-AES-256-CBC-SHA"},
 #ifdef ENABLE_CRYPTO_OPENSSL
+    /* OpenSSL-specific group names */
     {"DEFAULT", "DEFAULT"},
     {"ALL", "ALL"},
-    {"HIGH", "HIGH"},
-    {"MEDIUM", "MEDIUM"},
-    {"LOW", "LOW"},
-    {"ECDH", "ECDH"},
-    {"ECDSA", "ECDSA"},
-    {"EDH", "EDH"},
-    {"EXP", "EXP"},
-    {"RSA", "RSA"},
-    {"kRSA", "kRSA"},
-    {"SRP", "SRP"},
+    {"HIGH", "HIGH"}, {"!HIGH", "!HIGH"},
+    {"MEDIUM", "MEDIUM"}, {"!MEDIUM", "!MEDIUM"},
+    {"LOW", "LOW"}, {"!LOW", "!LOW"},
+    {"ECDH", "ECDH"}, {"!ECDH", "!ECDH"},
+    {"ECDSA", "ECDSA"}, {"!ECDSA", "!ECDSA"},
+    {"EDH", "EDH"}, {"!EDH", "!EDH"},
+    {"EXP", "EXP"}, {"!EXP", "!EXP"},
+    {"RSA", "RSA"}, {"!RSA", "!RSA"},
+    {"kRSA", "kRSA"}, {"!kRSA", "!kRSA"},
+    {"SRP", "SRP"}, {"!SRP", "!SRP"},
 #endif
     {NULL, NULL}
 };
+
+/**
+ * Update the implicit IV for a key_ctx_bi based on TLS session ids and cipher
+ * used.
+ *
+ * Note that the implicit IV is based on the HMAC key, but only in AEAD modes
+ * where the HMAC key is not used for an actual HMAC.
+ *
+ * @param ctx			Encrypt/decrypt key context
+ * @param key			HMAC key, used to calculate implicit IV
+ * @param key_len		HMAC key length
+ */
+static void
+key_ctx_update_implicit_iv(struct key_ctx *ctx, uint8_t *key, size_t key_len);
 
 const tls_cipher_name_pair *
 tls_get_cipher_name_pair (const char * cipher_name, size_t len) {
@@ -331,7 +350,7 @@ void
 pem_password_setup (const char *auth_file)
 {
   if (!strlen (passbuf.password))
-    get_user_pass (&passbuf, auth_file, UP_TYPE_PRIVATE_KEY, GET_USER_PASS_MANAGEMENT|GET_USER_PASS_SENSITIVE|GET_USER_PASS_PASSWORD_ONLY);
+    get_user_pass (&passbuf, auth_file, UP_TYPE_PRIVATE_KEY, GET_USER_PASS_MANAGEMENT|GET_USER_PASS_PASSWORD_ONLY);
 }
 
 int
@@ -374,11 +393,11 @@ auth_user_pass_setup (const char *auth_file, const struct static_challenge_info 
        get_user_pass_cr (&auth_user_pass,
                          auth_file,
                          UP_TYPE_AUTH,
-                         GET_USER_PASS_MANAGEMENT|GET_USER_PASS_SENSITIVE|GET_USER_PASS_DYNAMIC_CHALLENGE,
+                         GET_USER_PASS_MANAGEMENT|GET_USER_PASS_DYNAMIC_CHALLENGE,
                          auth_challenge);
       else if (sci) /* static challenge response */
        {
-         int flags = GET_USER_PASS_MANAGEMENT|GET_USER_PASS_SENSITIVE|GET_USER_PASS_STATIC_CHALLENGE;
+         int flags = GET_USER_PASS_MANAGEMENT|GET_USER_PASS_STATIC_CHALLENGE;
          if (sci->flags & SC_ECHO)
            flags |= GET_USER_PASS_STATIC_CHALLENGE_ECHO;
          get_user_pass_cr (&auth_user_pass,
@@ -389,7 +408,7 @@ auth_user_pass_setup (const char *auth_file, const struct static_challenge_info 
        }
       else
 # endif
-       get_user_pass (&auth_user_pass, auth_file, UP_TYPE_AUTH, GET_USER_PASS_MANAGEMENT|GET_USER_PASS_SENSITIVE);
+       get_user_pass (&auth_user_pass, auth_file, UP_TYPE_AUTH, GET_USER_PASS_MANAGEMENT);
 #endif
     }
 }
@@ -565,6 +584,9 @@ init_ssl (const struct options *options, struct tls_root_ctx *new_ctx)
       tls_ctx_load_extra_certs(new_ctx, options->extra_certs_file, options->extra_certs_file_inline);
     }
 
+  /* Check certificate notBefore and notAfter */
+  tls_ctx_check_cert_time(new_ctx);
+
   /* Once keys and cert are loaded, load ECDH parameters */
   if (options->tls_server)
     tls_ctx_load_ecdh_params(new_ctx, options->ecdh_curve);
@@ -572,7 +594,7 @@ init_ssl (const struct options *options, struct tls_root_ctx *new_ctx)
   /* Allowable ciphers */
   tls_ctx_restrict_ciphers(new_ctx, options->cipher_list);
 
-#ifdef ENABLE_CRYPTO_POLARSSL
+#ifdef ENABLE_CRYPTO_MBEDTLS
   /* Personalise the random by mixing in the certificate */
   tls_ctx_personalise_random (new_ctx);
 #endif
@@ -775,11 +797,17 @@ key_state_init (struct tls_session *session, struct key_state *ks)
   reliable_set_timeout (ks->send_reliable, session->opt->packet_timeout);
 
   /* init packet ID tracker */
-  packet_id_init (&ks->packet_id,
-		  session->opt->tcp_mode,
-		  session->opt->replay_window,
-		  session->opt->replay_time,
-		  "SSL", ks->key_id);
+  if (session->opt->replay)
+    {
+      packet_id_init (&ks->crypto_options.packet_id, session->opt->tcp_mode,
+	  session->opt->replay_window, session->opt->replay_time, "SSL",
+	  ks->key_id);
+    }
+
+  ks->crypto_options.pid_persist = NULL;
+  ks->crypto_options.flags = session->opt->crypto_flags;
+  ks->crypto_options.flags &= session->opt->crypto_flags_and;
+  ks->crypto_options.flags |= session->opt->crypto_flags_or;
 
 #ifdef MANAGEMENT_DEF_AUTH
   ks->mda_key_id = session->opt->mda_context->mda_key_id_counter++;
@@ -807,7 +835,7 @@ key_state_free (struct key_state *ks, bool clear)
 
   key_state_ssl_free(&ks->ks_ssl);
 
-  free_key_ctx_bi (&ks->key);
+  free_key_ctx_bi (&ks->crypto_options.key_ctx_bi);
   free_buf (&ks->plaintext_read_buf);
   free_buf (&ks->plaintext_write_buf);
   free_buf (&ks->ack_write_buf);
@@ -831,7 +859,7 @@ key_state_free (struct key_state *ks, bool clear)
   if (ks->key_src)
     free (ks->key_src);
 
-  packet_id_free (&ks->packet_id);
+  packet_id_free (&ks->crypto_options.packet_id);
 
 #ifdef PLUGIN_DEF_AUTH
   key_state_rm_auth_control_file (ks);
@@ -845,13 +873,6 @@ key_state_free (struct key_state *ks, bool clear)
 
 /** @} addtogroup control_processor */
 
-
-/*
- * Must be called if we move a tls_session in memory.
- */
-static inline void tls_session_set_self_referential_pointers (struct tls_session* session) {
-  session->tls_auth.packet_id = &session->tls_auth_pid;
-}
 
 /**
  * Returns whether or not the server should check for username/password
@@ -925,18 +946,15 @@ tls_session_init (struct tls_multi *multi, struct tls_session *session)
   /* Initialize control channel authentication parameters */
   session->tls_auth = session->opt->tls_auth;
 
-  /* Set session internal pointers (also called if session object is moved in memory) */
-  tls_session_set_self_referential_pointers (session);
-
   /* initialize packet ID replay window for --tls-auth */
-  packet_id_init (session->tls_auth.packet_id,
+  packet_id_init (&session->tls_auth.packet_id,
 		  session->opt->tcp_mode,
 		  session->opt->replay_window,
 		  session->opt->replay_time,
 		  "TLS_AUTH", session->key_id);
 
   /* load most recent packet-id to replay protect on --tls-auth */
-  packet_id_persist_load_obj (session->tls_auth.pid_persist, session->tls_auth.packet_id);
+  packet_id_persist_load_obj (session->tls_auth.pid_persist, &session->tls_auth.packet_id);
 
   key_state_init (session, &session->key[KS_PRIMARY]);
 
@@ -963,8 +981,8 @@ tls_session_free (struct tls_session *session, bool clear)
 {
   int i;
 
-  if (session->tls_auth.packet_id)
-    packet_id_free (session->tls_auth.packet_id);
+  if (packet_id_initialized(&session->tls_auth.packet_id))
+    packet_id_free (&session->tls_auth.packet_id);
 
   for (i = 0; i < KS_SIZE; ++i)
     key_state_free (&session->key[i], false);
@@ -995,7 +1013,6 @@ move_session (struct tls_multi* multi, int dest, int src, bool reinit_src)
   ASSERT (dest >= 0 && dest < TM_SIZE);
   tls_session_free (&multi->session[dest], false);
   multi->session[dest] = multi->session[src];
-  tls_session_set_self_referential_pointers (&multi->session[dest]);
 
   if (reinit_src)
     tls_session_init (multi, &multi->session[src]);
@@ -1060,9 +1077,6 @@ tls_multi_init (struct tls_options *tls_options)
   /* get command line derived options */
   ret->opt = *tls_options;
 
-  /* set up pointer to HMAC object for TLS packet authentication */
-  ret->opt.tls_auth.key_ctx_bi = &ret->opt.tls_auth_key;
-
   /* set up list of keys to be scanned by data channel encrypt and decrypt routines */
   ASSERT (SIZE (ret->key_scan) == 3);
   ret->key_scan[0] = &ret->session[TM_ACTIVE].key[KS_PRIMARY];
@@ -1101,8 +1115,7 @@ tls_auth_standalone_init (struct tls_options *tls_options,
   ALLOC_OBJ_CLEAR_GC (tas, struct tls_auth_standalone, gc);
 
   /* set up pointer to HMAC object for TLS packet authentication */
-  tas->tls_auth_key = tls_options->tls_auth_key;
-  tas->tls_auth_options.key_ctx_bi = &tas->tls_auth_key;
+  tas->tls_auth_options.key_ctx_bi = tls_options->tls_auth.key_ctx_bi;
   tas->tls_auth_options.flags |= CO_PACKET_ID_LONG_FORM;
 
   /* get initial frame parms, still need to finalize */
@@ -1185,11 +1198,11 @@ tls_multi_free (struct tls_multi *multi, bool clear)
 static bool
 swap_hmac (struct buffer *buf, const struct crypto_options *co, bool incoming)
 {
-  struct key_ctx *ctx;
+  const struct key_ctx *ctx;
 
   ASSERT (co);
 
-  ctx = (incoming ? &co->key_ctx_bi->decrypt : &co->key_ctx_bi->encrypt);
+  ctx = (incoming ? &co->key_ctx_bi.decrypt : &co->key_ctx_bi.encrypt);
   ASSERT (ctx->hmac);
 
   {
@@ -1253,10 +1266,10 @@ write_control_auth (struct tls_session *session,
   ASSERT (session_id_write_prepend (&session->session_id, buf));
   ASSERT (header = buf_prepend (buf, 1));
   *header = ks->key_id | (opcode << P_OPCODE_SHIFT);
-  if (session->tls_auth.key_ctx_bi->encrypt.hmac)
+  if (session->tls_auth.key_ctx_bi.encrypt.hmac)
     {
       /* no encryption, only write hmac */
-      openvpn_encrypt (buf, null, &session->tls_auth, NULL);
+      openvpn_encrypt (buf, null, &session->tls_auth);
       ASSERT (swap_hmac (buf, &session->tls_auth, false));
     }
   *to_link_addr = &ks->remote_addr;
@@ -1267,12 +1280,12 @@ write_control_auth (struct tls_session *session,
  */
 static bool
 read_control_auth (struct buffer *buf,
-		   const struct crypto_options *co,
+		   struct crypto_options *co,
 		   const struct link_socket_actual *from)
 {
   struct gc_arena gc = gc_new ();
 
-  if (co->key_ctx_bi->decrypt.hmac)
+  if (co->key_ctx_bi.decrypt.hmac)
     {
       struct buffer null = clear_buf ();
 
@@ -1288,7 +1301,7 @@ read_control_auth (struct buffer *buf,
 
       /* authenticate only (no decrypt) and remove the hmac record
          from the head of the buffer */
-      openvpn_decrypt (buf, null, co, NULL);
+      openvpn_decrypt (buf, null, co, NULL, BPTR (buf));
       if (!buf->len)
 	{
 	  msg (D_TLS_ERRORS,
@@ -1442,7 +1455,7 @@ tls1_P_hash(const md_kt_t *md_kt,
  * (2) The pre-master secret is generated by the client.
  */
 static void
-tls1_PRF(uint8_t *label,
+tls1_PRF(const uint8_t *label,
 	 int label_len,
 	 const uint8_t *sec,
 	 int slen,
@@ -1594,6 +1607,12 @@ generate_key_expansion (struct key_ctx_bi *key,
 		OPENVPN_OP_DECRYPT,
 		"Data Channel Decrypt");
 
+  /* Initialize implicit IVs */
+  key_ctx_update_implicit_iv (&key->encrypt, key2.keys[(int)server].hmac,
+      MAX_HMAC_KEY_LENGTH);
+  key_ctx_update_implicit_iv (&key->decrypt, key2.keys[1-(int)server].hmac,
+      MAX_HMAC_KEY_LENGTH);
+
   ret = true;
 
  exit:
@@ -1601,6 +1620,23 @@ generate_key_expansion (struct key_ctx_bi *key,
   CLEAR (key2);
 
   return ret;
+}
+
+static void
+key_ctx_update_implicit_iv(struct key_ctx *ctx, uint8_t *key, size_t key_len) {
+  const cipher_kt_t *cipher_kt = cipher_ctx_get_cipher_kt (ctx->cipher);
+
+  /* Only use implicit IV in AEAD cipher mode, where HMAC key is not used */
+  if (cipher_kt_mode_aead (cipher_kt))
+    {
+      size_t impl_iv_len = 0;
+      ASSERT (cipher_kt_iv_size (cipher_kt) >= OPENVPN_AEAD_MIN_IV_LEN);
+      impl_iv_len = cipher_kt_iv_size (cipher_kt) - sizeof (packet_id_type);
+      ASSERT (impl_iv_len <= OPENVPN_MAX_IV_LENGTH);
+      ASSERT (impl_iv_len <= key_len);
+      memcpy (ctx->implicit_iv, key, impl_iv_len);
+      ctx->implicit_iv_len = impl_iv_len;
+    }
 }
 
 static bool
@@ -1792,8 +1828,9 @@ key_method_1_write (struct buffer *buf, struct tls_session *session)
       return false;
     }
 
-  init_key_ctx (&ks->key.encrypt, &key, &session->opt->key_type,
-		OPENVPN_OP_ENCRYPT, "Data Channel Encrypt");
+  init_key_ctx (&ks->crypto_options.key_ctx_bi.encrypt, &key,
+		&session->opt->key_type, OPENVPN_OP_ENCRYPT,
+		"Data Channel Encrypt");
   CLEAR (key);
 
   /* send local options string */
@@ -1864,6 +1901,9 @@ push_peer_info(struct buffer *buf, struct tls_session *session)
 	  if (rgi.flags & RGI_HWADDR_DEFINED)
 	    buf_printf (&out, "IV_HWADDR=%s\n", format_hex_ex (rgi.hwaddr, 6, 0, 1, ":", &gc));
 	  buf_printf (&out, "IV_SSL=%s\n", get_ssl_library_version() );
+#if defined(WIN32)
+	  buf_printf (&out, "IV_PLAT_VER=%s\n", win32_version_string (&gc, false));
+#endif
         }
 
       /* push env vars that begin with UV_ and IV_GUI_VER */
@@ -1952,7 +1992,7 @@ key_method_2_write (struct buffer *buf, struct tls_session *session)
     {
       if (ks->authenticated)
 	{
-	  if (!generate_key_expansion (&ks->key,
+	  if (!generate_key_expansion (&ks->crypto_options.key_ctx_bi,
 				       &session->opt->key_type,
 				       ks->key_src,
 				       &ks->session_id_remote,
@@ -2023,8 +2063,9 @@ key_method_1_read (struct buffer *buf, struct tls_session *session)
 
   buf_clear (buf);
 
-  init_key_ctx (&ks->key.decrypt, &key, &session->opt->key_type,
-		OPENVPN_OP_DECRYPT, "Data Channel Decrypt");
+  init_key_ctx (&ks->crypto_options.key_ctx_bi.decrypt, &key,
+		&session->opt->key_type, OPENVPN_OP_DECRYPT,
+		"Data Channel Decrypt");
   CLEAR (key);
   ks->authenticated = true;
   return true;
@@ -2159,8 +2200,12 @@ key_method_2_read (struct buffer *buf, struct tls_multi *multi, struct tls_sessi
    */
   if (ks->authenticated && plugin_defined (session->opt->plugins, OPENVPN_PLUGIN_TLS_FINAL))
     {
+      key_state_export_keying_material(&ks->ks_ssl, session);
+
       if (plugin_call (session->opt->plugins, OPENVPN_PLUGIN_TLS_FINAL, NULL, NULL, session->opt->es) != OPENVPN_PLUGIN_FUNC_SUCCESS)
 	ks->authenticated = false;
+
+      setenv_del (session->opt->es, "exported_keying_material");
     }
 
   /*
@@ -2168,7 +2213,7 @@ key_method_2_read (struct buffer *buf, struct tls_multi *multi, struct tls_sessi
    */
   if (!session->opt->server)
     {
-      if (!generate_key_expansion (&ks->key,
+      if (!generate_key_expansion (&ks->crypto_options.key_ctx_bi,
 				   &session->opt->key_type,
 				   ks->key_src,
 				   &session->session_id,
@@ -2240,7 +2285,7 @@ tls_process (struct tls_multi *multi,
 	   && ks->n_bytes >= session->opt->renegotiate_bytes)
        || (session->opt->renegotiate_packets
 	   && ks->n_packets >= session->opt->renegotiate_packets)
-       || (packet_id_close_to_wrapping (&ks->packet_id.send))))
+       || (packet_id_close_to_wrapping (&ks->crypto_options.packet_id.send))))
     {
       msg (D_TLS_DEBUG_LOW,
            "TLS: soft reset sec=%d bytes=" counter_format "/%d pkts=" counter_format "/%d",
@@ -2302,8 +2347,10 @@ tls_process (struct tls_multi *multi,
 		      management_set_state (management,
 					    OPENVPN_STATE_WAIT,
 					    NULL,
-					    0,
-					    0);
+                                            NULL,
+                                            NULL,
+                                            NULL,
+                                            NULL);
 		    }
 #endif
 		}
@@ -2794,8 +2841,9 @@ bool
 tls_pre_decrypt (struct tls_multi *multi,
 		 const struct link_socket_actual *from,
 		 struct buffer *buf,
-		 struct crypto_options *opt,
-		 bool floated)
+		 struct crypto_options **opt,
+		 bool floated,
+		 const uint8_t **ad_start)
 {
   struct gc_arena gc = gc_new ();
   bool ret = false;
@@ -2842,14 +2890,17 @@ tls_pre_decrypt (struct tls_multi *multi,
 		  && (floated || link_socket_actual_match (from, &ks->remote_addr)))
 		{
 		  /* return appropriate data channel decrypt key in opt */
-		  opt->key_ctx_bi = &ks->key;
-		  opt->packet_id = multi->opt.replay ? &ks->packet_id : NULL;
-		  opt->pid_persist = NULL;
-		  opt->flags &= multi->opt.crypto_flags_and;
-		  opt->flags |= multi->opt.crypto_flags_or;
-
-		  ASSERT (buf_advance (buf, 1));
+		  *opt = &ks->crypto_options;
 		  if (op == P_DATA_V2)
+		    {
+		      *ad_start = BPTR(buf);
+		    }
+		  ASSERT (buf_advance (buf, 1));
+		  if (op == P_DATA_V1)
+		    {
+		      *ad_start = BPTR(buf);
+		    }
+		  else if (op == P_DATA_V2)
 		    {
 		      if (buf->len < 4)
 			{
@@ -3011,8 +3062,10 @@ tls_pre_decrypt (struct tls_multi *multi,
 		      management_set_state (management,
 					    OPENVPN_STATE_AUTH,
 					    NULL,
-					    0,
-					    0);
+                                            NULL,
+                                            NULL,
+                                            NULL,
+                                            NULL);
 		    }
 #endif
 
@@ -3235,10 +3288,7 @@ tls_pre_decrypt (struct tls_multi *multi,
 
  done:
   buf->len = 0;
-  opt->key_ctx_bi = NULL;
-  opt->packet_id = NULL;
-  opt->pid_persist = NULL;
-  opt->flags &= multi->opt.crypto_flags_and;
+  *opt = NULL;
   gc_free (&gc);
   return ret;
 
@@ -3364,7 +3414,7 @@ tls_pre_decrypt_lite (const struct tls_auth_standalone *tas,
 /* Choose the key with which to encrypt a data packet */
 void
 tls_pre_encrypt (struct tls_multi *multi,
-		 struct buffer *buf, struct crypto_options *opt)
+		 struct buffer *buf, struct crypto_options **opt)
 {
   multi->save_ks = NULL;
   if (buf->len > 0)
@@ -3393,11 +3443,7 @@ tls_pre_encrypt (struct tls_multi *multi,
 
       if (ks_select)
 	{
-	  opt->key_ctx_bi = &ks_select->key;
-	  opt->packet_id = multi->opt.replay ? &ks_select->packet_id : NULL;
-	  opt->pid_persist = NULL;
-	  opt->flags &= multi->opt.crypto_flags_and;
-	  opt->flags |= multi->opt.crypto_flags_or;
+	  *opt = &ks_select->crypto_options;
 	  multi->save_ks = ks_select;
 	  dmsg (D_TLS_KEYSELECT, "TLS: tls_pre_encrypt: key_id=%d", ks_select->key_id);
 	  return;
@@ -3412,36 +3458,48 @@ tls_pre_encrypt (struct tls_multi *multi,
     }
 
   buf->len = 0;
-  opt->key_ctx_bi = NULL;
-  opt->packet_id = NULL;
-  opt->pid_persist = NULL;
-  opt->flags &= multi->opt.crypto_flags_and;
+  *opt = NULL;
 }
 
-/* Prepend the appropriate opcode to encrypted buffer prior to TCP/UDP send */
+void
+tls_prepend_opcode_v1 (const struct tls_multi *multi, struct buffer *buf)
+{
+  struct key_state *ks = multi->save_ks;
+  uint8_t op;
+
+  msg (D_TLS_DEBUG, __func__);
+
+  ASSERT (ks);
+
+  op = (P_DATA_V1 << P_OPCODE_SHIFT) | ks->key_id;
+  ASSERT (buf_write_prepend (buf, &op, 1));
+}
+
+void
+tls_prepend_opcode_v2 (const struct tls_multi *multi, struct buffer *buf)
+{
+  struct key_state *ks = multi->save_ks;
+  uint32_t peer;
+
+  msg (D_TLS_DEBUG, __func__);
+
+  ASSERT (ks);
+
+  peer = htonl(((P_DATA_V2 << P_OPCODE_SHIFT) | ks->key_id) << 24
+      | (multi->peer_id & 0xFFFFFF));
+  ASSERT (buf_write_prepend (buf, &peer, 4));
+}
+
 void
 tls_post_encrypt (struct tls_multi *multi, struct buffer *buf)
 {
-  struct key_state *ks;
-  uint8_t *op;
-  uint32_t peer;
-
-  ks = multi->save_ks;
+  struct key_state *ks = multi->save_ks;
   multi->save_ks = NULL;
+
   if (buf->len > 0)
     {
       ASSERT (ks);
 
-      if (!multi->opt.server && multi->use_peer_id)
-	{
-	  peer = htonl(((P_DATA_V2 << P_OPCODE_SHIFT) | ks->key_id) << 24 | (multi->peer_id & 0xFFFFFF));
-	  ASSERT (buf_write_prepend (buf, &peer, 4));
-	}
-      else
-	{
-	  ASSERT (op = buf_prepend (buf, 1));
-	  *op = (P_DATA_V1 << P_OPCODE_SHIFT) | ks->key_id;
-	}
       ++ks->n_packets;
       ks->n_bytes += buf->len;
     }

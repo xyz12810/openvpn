@@ -136,7 +136,6 @@
  */
 struct tls_auth_standalone
 {
-  struct key_ctx_bi tls_auth_key;
   struct crypto_options tls_auth_options;
   struct frame frame;
 };
@@ -293,9 +292,10 @@ int tls_multi_process (struct tls_multi *multi,
  *     of this packet.
  * @param from - The source address of the packet.
  * @param buf - A buffer structure containing the incoming packet.
- * @param opt - A crypto options structure that will be loaded with the
- *     appropriate security parameters to handle the packet if it is a
- *     data channel packet.
+ * @param opt - Returns a crypto options structure with the appropriate security
+ *     parameters to handle the packet if it is a data channel packet.
+ * @param ad_start - Returns a pointer to the start of the authenticated data of
+ *     of this packet
  *
  * @return
  * @li True if the packet is a control channel packet that has been
@@ -306,8 +306,9 @@ int tls_multi_process (struct tls_multi *multi,
 bool tls_pre_decrypt (struct tls_multi *multi,
 		      const struct link_socket_actual *from,
 		      struct buffer *buf,
-		      struct crypto_options *opt,
-		      bool floated);
+		      struct crypto_options **opt,
+		      bool floated,
+		      const uint8_t **ad_start);
 
 
 /**************************************************************************/
@@ -356,20 +357,53 @@ bool tls_pre_decrypt_lite (const struct tls_auth_standalone *tas,
  * @ingroup data_crypto
  *
  * If no appropriate security parameters can be found, or if some other
- * error occurs, then the buffer is set to empty.
+ * error occurs, then the buffer is set to empty, and the parameters to a NULL
+ * pointer.
  *
  * @param multi - The TLS state for this packet's destination VPN tunnel.
  * @param buf - The buffer containing the outgoing packet.
- * @param opt - The crypto options structure into which the appropriate
- *     security parameters should be loaded.
+ * @param opt - Returns a crypto options structure with the security parameters.
  */
 void tls_pre_encrypt (struct tls_multi *multi,
-		      struct buffer *buf, struct crypto_options *opt);
+		      struct buffer *buf, struct crypto_options **opt);
 
 
 /**
- * Prepend the one-byte OpenVPN header to the packet, and perform some
- * accounting for the key state used.
+ * Prepend a one-byte OpenVPN data channel P_DATA_V1 opcode to the packet.
+ *
+ * The opcode identifies the packet as a V1 data channel packet and gives the
+ * low-permutation version of the key-id to the recipient, so it knows which
+ * decrypt key to use.
+ *
+ * @param multi - The TLS state for this packet's destination VPN tunnel.
+ * @param buf - The buffer to write the header to.
+ *
+ * @ingroup data_crypto
+ */
+void
+tls_prepend_opcode_v1 (const struct tls_multi *multi, struct buffer *buf);
+
+/**
+ * Prepend an OpenVPN data channel P_DATA_V2 header to the packet.  The
+ * P_DATA_V2 header consists of a 1-byte opcode, followed by a 3-byte peer-id.
+ *
+ * The opcode identifies the packet as a V2 data channel packet and gives the
+ * low-permutation version of the key-id to the recipient, so it knows which
+ * decrypt key to use.
+ *
+ * The peer-id is sent by clients to servers to help the server determine to
+ * select the decrypt key when the client is roaming between addresses/ports.
+ *
+ * @param multi - The TLS state for this packet's destination VPN tunnel.
+ * @param buf - The buffer to write the header to.
+ *
+ * @ingroup data_crypto
+ */
+void
+tls_prepend_opcode_v2 (const struct tls_multi *multi, struct buffer *buf);
+
+/**
+ * Perform some accounting for the key state used.
  * @ingroup data_crypto
  *
  * @param multi - The TLS state for this packet's destination VPN tunnel.

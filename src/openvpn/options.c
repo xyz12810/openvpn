@@ -68,20 +68,17 @@ const char title_string[] =
 #endif
   " " TARGET_ALIAS
 #ifdef ENABLE_CRYPTO
-#if defined(ENABLE_CRYPTO_POLARSSL)
-  " [SSL (PolarSSL)]"
+#if defined(ENABLE_CRYPTO_MBEDTLS)
+  " [SSL (mbed TLS)]"
 #elif defined(ENABLE_CRYPTO_OPENSSL)
   " [SSL (OpenSSL)]"
 #else
   " [SSL]"
-#endif /* defined(ENABLE_CRYPTO_POLARSSL) */
+#endif /* defined(ENABLE_CRYPTO_MBEDTLS) */
 #endif /* ENABLE_CRYPTO */
 #ifdef USE_COMP
 #ifdef ENABLE_LZO
   " [LZO]"
-#endif
-#ifdef ENABLE_SNAPPY
-  " [SNAPPY]"
 #endif
 #ifdef ENABLE_LZ4
   " [LZ4]"
@@ -435,6 +432,9 @@ static const char usage_message[] =
   "                  Only valid in a client-specific config file.\n"
   "--client-cert-not-required : Don't require client certificate, client\n"
   "                  will authenticate using username/password.\n"
+  "--verify-client-cert [none|optional|require] : perform no, optional or\n"
+  "                  mandatory client certificate verification.\n"
+  "                  Default is to require the client to supply a certificate.\n"
   "--username-as-common-name  : For auth-user-pass authentication, use\n"
   "                  the authenticated username as the common name,\n"
   "                  rather than the common name from the client cert.\n"
@@ -469,6 +469,9 @@ static const char usage_message[] =
   "--stale-routes-check n [t] : Remove routes with a last activity timestamp\n"
   "                             older than n seconds. Run this check every t\n"
   "                             seconds (defaults to n).\n"
+  "--explicit-exit-notify [n] : In UDP server mode send [RESTART] command on exit/restart to connected\n"
+  "                             clients. n = 1 - reconnect to same server,\n"
+  "                             2 - advance to next server, default=1.\n"
 #if PORT_SHARE
   "--port-share host port [dir] : When run in TCP mode, proxy incoming HTTPS\n"
   "                  sessions to a web server at host:port.  dir specifies an\n"
@@ -479,11 +482,18 @@ static const char usage_message[] =
   "Client options (when connecting to a multi-client server):\n"
   "--client         : Helper option to easily configure client mode.\n"
   "--auth-user-pass [up] : Authenticate with server using username/password.\n"
-  "                  up is a file containing username/password on 2 lines,\n"
-  "                  or omit to prompt from console.\n"
+  "                  up is a file containing the username on the first line,\n"
+  "                  and a password on the second. If either the password or both\n"
+  "                  the username and the password are omitted OpenVPN will prompt\n"
+  "                  for them from console.\n"
   "--pull           : Accept certain config file options from the peer as if they\n"
   "                  were part of the local config file.  Must be specified\n"
   "                  when connecting to a '--mode server' remote host.\n"
+  "--pull-filter accept|ignore|reject t : Filter each option received from the\n"
+  "                  server if it starts with the text t. The action flag accept,\n"
+  "                  ignore or reject causes the option to be allowed, removed or\n"
+  "                  rejected with error. May be specified multiple times, and\n"
+  "                  each filter is applied in the order of appearance.\n"
   "--auth-retry t  : How to handle auth failures.  Set t to\n"
   "                  none (default), interact, or nointeract.\n"
   "--static-challenge t e : Enable static challenge/response protocol using\n"
@@ -519,7 +529,7 @@ static const char usage_message[] =
   "--keysize n     : Size of cipher key in bits (optional).\n"
   "                  If unspecified, defaults to cipher-specific default.\n"
 #endif
-#ifndef ENABLE_CRYPTO_POLARSSL
+#ifndef ENABLE_CRYPTO_MBEDTLS
   "--engine [name] : Enable OpenSSL hardware crypto engine functionality.\n"
 #endif
   "--no-replay     : Disable replay protection.\n"
@@ -545,10 +555,10 @@ static const char usage_message[] =
   "                  number, such as 1 (default), 2, etc.\n"
   "--ca file       : Certificate authority file in .pem format containing\n"
   "                  root certificate.\n"
-#ifndef ENABLE_CRYPTO_POLARSSL
+#ifndef ENABLE_CRYPTO_MBEDTLS
   "--capath dir    : A directory of trusted certificates (CAs"
   " and CRLs).\n"
-#endif /* ENABLE_CRYPTO_POLARSSL */
+#endif /* ENABLE_CRYPTO_MBEDTLS */
   "--dh file       : File containing Diffie Hellman parameters\n"
   "                  in .pem format (for --tls-server only).\n"
   "                  Use \"openssl dhparam -out dh1024.pem 1024\" to generate.\n"
@@ -560,7 +570,7 @@ static const char usage_message[] =
   "    will accept from the peer.  If version is unrecognized and 'or-highest'\n"
   "    is specified, require max TLS version supported by SSL implementation.\n"
   "--tls-version-max <version> : sets the maximum TLS version we will use.\n"
-#ifndef ENABLE_CRYPTO_POLARSSL
+#ifndef ENABLE_CRYPTO_MBEDTLS
   "--pkcs12 file   : PKCS#12 file containing local private key, local certificate\n"
   "                  and optionally the root CA certificate.\n"
 #endif
@@ -607,9 +617,11 @@ static const char usage_message[] =
   "                  of verification.\n"
   "--ns-cert-type t: Require that peer certificate was signed with an explicit\n"
   "                  nsCertType designation t = 'client' | 'server'.\n"
-#ifdef ENABLE_X509_TRACK
   "--x509-track x  : Save peer X509 attribute x in environment for use by\n"
   "                  plugins and management interface.\n"
+#if defined(ENABLE_CRYPTO_OPENSSL) && OPENSSL_VERSION_NUMBER >= 0x10001000
+  "--keying-material-exporter label len : Save Exported Keying Material (RFC5705)\n"
+  "                  of len bytes (min. 16 bytes) using label in environment for use by plugins.\n"
 #endif
   "--remote-cert-ku v ... : Require that the peer certificate was signed with\n"
   "                  explicit key usage, you can specify more than one value.\n"
@@ -695,6 +707,9 @@ static const char usage_message[] =
   "                       optional parameter controls the initial state of ex.\n"
   "--show-net-up   : Show " PACKAGE_NAME "'s view of routing table and net adapter list\n"
   "                  after TAP adapter is up and routes have been added.\n"
+#ifdef WIN32
+  "--block-outside-dns   : Block DNS on other network adapters to prevent DNS leaks\n"
+#endif
   "Windows Standalone Options:\n"
   "\n"
   "--show-adapters : Show all TAP-Windows adapters.\n"
@@ -784,10 +799,6 @@ init_options (struct options *o, const bool init_gc)
 #ifdef ENABLE_FEATURE_TUN_PERSIST
   o->persist_mode = 1;
 #endif
-#ifndef WIN32
-  o->rcvbuf = 65536;
-  o->sndbuf = 65536;
-#endif
 #ifdef TARGET_LINUX
   o->tuntap_options.txqueuelen = 100;
 #endif
@@ -800,6 +811,7 @@ init_options (struct options *o, const bool init_gc)
   o->tuntap_options.dhcp_lease_time = 31536000; /* one year */
   o->tuntap_options.dhcp_masq_offset = 0;       /* use network address as internal DHCP server address */
   o->route_method = ROUTE_METHOD_ADAPTIVE;
+  o->block_outside_dns = false;
 #endif
 #if P2MP_SERVER
   o->real_hash_size = 256;
@@ -867,6 +879,37 @@ uninit_options (struct options *o)
     {
       gc_free (&o->gc);
     }
+}
+
+struct pull_filter
+{
+# define PUF_TYPE_UNDEF  0   /** undefined filter type */
+# define PUF_TYPE_ACCEPT 1   /** filter type to accept a matching option */
+# define PUF_TYPE_IGNORE 2   /** filter type to ignore a matching option */
+# define PUF_TYPE_REJECT 3   /** filter type to reject and trigger SIGUSR1 */
+  int type;
+  int size;
+  char *pattern;
+  struct pull_filter *next;
+};
+
+struct pull_filter_list
+{
+  struct pull_filter *head;
+  struct pull_filter *tail;
+};
+
+static const char *
+pull_filter_type_name (int type)
+{
+  if (type == PUF_TYPE_ACCEPT)
+    return "accept";
+  if (type == PUF_TYPE_IGNORE)
+    return "ignore";
+  if (type == PUF_TYPE_REJECT)
+    return "reject";
+  else
+    return "???";
 }
 
 #ifndef ENABLE_SMALL
@@ -944,13 +987,11 @@ get_ip_addr (const char *ip_string, int msglevel, bool *error)
  * "/nn" is optional, default to /64 if missing
  *
  * return true if parsing succeeded, modify *network and *netbits
- * return address part without "/nn" in *printable_ipv6 (if != NULL)
  */
 bool
 get_ipv6_addr( const char * prefix_str, struct in6_addr *network,
-	       unsigned int * netbits, char ** printable_ipv6, int msglevel )
+	       unsigned int * netbits, int msglevel)
 {
-    int rc;
     char * sep, * endp;
     int bits;
     struct in6_addr t_network;
@@ -977,20 +1018,13 @@ get_ipv6_addr( const char * prefix_str, struct in6_addr *network,
 
     if ( sep != NULL ) *sep = '\0';
 
-    rc = inet_pton( AF_INET6, prefix_str, &t_network );
-
-    if ( rc == 1 && printable_ipv6 != NULL )
-      {
-	*printable_ipv6 = string_alloc( prefix_str, NULL );
-      }
-
-    if ( sep != NULL ) *sep = '/';
-
-    if ( rc != 1 )
+    if ( inet_pton( AF_INET6, prefix_str, &t_network ) != 1 )
       {
 	msg (msglevel, "IPv6 prefix '%s': invalid IPv6 address", prefix_str);
 	return false;
       }
+
+    if ( sep != NULL ) *sep = '/';
 
     if ( netbits != NULL )
       {
@@ -1003,12 +1037,35 @@ get_ipv6_addr( const char * prefix_str, struct in6_addr *network,
     return true;		/* parsing OK, values set */
 }
 
+/**
+ * Returns newly allocated string containing address part without "/nn".
+ *
+ * If gc != NULL, the allocated memory is registered in the supplied gc.
+ */
+static char *
+get_ipv6_addr_no_netbits (const char *addr, struct gc_arena *gc)
+{
+  const char *end = strchr (addr, '/');
+  char *ret = NULL;
+  if (NULL == end)
+    {
+      ret = string_alloc (addr, gc);
+    }
+  else
+    {
+      size_t len = end - addr;
+      ret = gc_malloc (len + 1, true, gc);
+      memcpy (ret, addr, len);
+    }
+  return ret;
+}
+
 static bool ipv6_addr_safe_hexplusbits( const char * ipv6_prefix_spec )
 {
     struct in6_addr t_addr;
     unsigned int t_bits;
 
-    return get_ipv6_addr( ipv6_prefix_spec, &t_addr, &t_bits, NULL, M_WARN );
+    return get_ipv6_addr( ipv6_prefix_spec, &t_addr, &t_bits, M_WARN );
 }
 
 static char *
@@ -1252,7 +1309,7 @@ option_iroute_ipv6 (struct options *o,
 
   ALLOC_OBJ_GC (ir, struct iroute_ipv6, &o->gc);
 
-  if ( !get_ipv6_addr (prefix_str, &ir->network, &ir->netbits, NULL, msglevel ))
+  if ( !get_ipv6_addr (prefix_str, &ir->network, &ir->netbits, msglevel ))
     {
       msg (msglevel, "in --iroute-ipv6 %s: Bad IPv6 prefix specification",
 	   prefix_str);
@@ -1386,6 +1443,20 @@ show_connection_entries (const struct options *o)
   msg (D_SHOW_PARMS, "Connection profiles END");
 }
 
+static void
+show_pull_filter_list (const struct pull_filter_list *l)
+{
+  struct pull_filter *f;
+  if (!l)
+    return;
+
+  msg (D_SHOW_PARMS, "  Pull filters:");
+  for (f = l->head; f; f = f->next)
+    {
+      msg (D_SHOW_PARMS, "    %s \"%s\"", pull_filter_type_name(f->type), f->pattern);
+    }
+}
+
 #endif
 
 void
@@ -1516,6 +1587,8 @@ show_settings (const struct options *o)
   SHOW_BOOL (route_nopull);
   SHOW_BOOL (route_gateway_via_dhcp);
   SHOW_BOOL (allow_pull_fqdn);
+  show_pull_filter_list (o->pull_filter_list);
+
   if (o->routes)
     print_route_options (o->routes, D_SHOW_PARMS);
 
@@ -1548,9 +1621,9 @@ show_settings (const struct options *o)
   SHOW_STR (prng_hash);
   SHOW_INT (prng_nonce_secret_len);
   SHOW_INT (keysize);
-#ifndef ENABLE_CRYPTO_POLARSSL
+#ifndef ENABLE_CRYPTO_MBEDTLS
   SHOW_BOOL (engine);
-#endif /* ENABLE_CRYPTO_POLARSSL */
+#endif /* ENABLE_CRYPTO_MBEDTLS */
   SHOW_BOOL (replay);
   SHOW_BOOL (mute_replay_warnings);
   SHOW_INT (replay_window);
@@ -1582,7 +1655,7 @@ show_settings (const struct options *o)
   else
 #endif
   SHOW_STR (priv_key_file);
-#ifndef ENABLE_CRYPTO_POLARSSL
+#ifndef ENABLE_CRYPTO_MBEDTLS
   SHOW_STR (pkcs12_file);
 #endif
 #ifdef ENABLE_CRYPTOAPI
@@ -1654,6 +1727,7 @@ show_settings (const struct options *o)
 #ifdef WIN32
   SHOW_BOOL (show_net_up);
   SHOW_INT (route_method);
+  SHOW_BOOL (block_outside_dns);
   show_tuntap_options (&o->tuntap_options);
 #endif
 #endif
@@ -1773,6 +1847,35 @@ alloc_remote_entry (struct options *options, const int msglevel)
   ALLOC_OBJ_GC (e, struct remote_entry, &options->gc);
   l->array[l->len++] = e;
   return e;
+}
+
+static struct pull_filter_list *
+alloc_pull_filter_list (struct options *o)
+{
+  if (!o->pull_filter_list)
+    ALLOC_OBJ_CLEAR_GC (o->pull_filter_list, struct pull_filter_list, &o->gc);
+  return o->pull_filter_list;
+}
+
+static struct pull_filter *
+alloc_pull_filter (struct options *o, const int msglevel)
+{
+  struct pull_filter_list *l = alloc_pull_filter_list (o);
+  struct pull_filter *f;
+
+  ALLOC_OBJ_CLEAR_GC (f, struct pull_filter, &o->gc);
+  if (l->head)
+    {
+      ASSERT (l->tail);
+      l->tail->next = f;
+    }
+  else
+    {
+      ASSERT (!l->tail);
+      l->head = f;
+    }
+  l->tail = f;
+  return f;
 }
 
 void
@@ -1978,6 +2081,8 @@ options_postprocess_verify_ce (const struct options *options, const struct conne
 	msg (M_USAGE, "--mode server only works with --dev tun or --dev tap");
       if (options->pull)
 	msg (M_USAGE, "--pull cannot be used with --mode server");
+      if (options->pull_filter_list)
+	msg (M_USAGE, "--pull-filter cannot be used with --mode server");
       if (!(proto_is_udp(ce->proto) || ce->proto == PROTO_TCP_SERVER))
 	msg (M_USAGE, "--mode server currently only supports "
 	     "--proto udp or --proto tcp-server or proto tcp6-server");
@@ -2020,10 +2125,6 @@ options_postprocess_verify_ce (const struct options *options, const struct conne
 	msg (M_USAGE, "--connect-freq only works with --mode server --proto udp.  Try --max-clients instead.");
       if (!(dev == DEV_TYPE_TAP || (dev == DEV_TYPE_TUN && options->topology == TOP_SUBNET)) && options->ifconfig_pool_netmask)
 	msg (M_USAGE, "The third parameter to --ifconfig-pool (netmask) is only valid in --dev tap mode");
-#ifdef ENABLE_OCC
-      if (ce->explicit_exit_notification)
-	msg (M_USAGE, "--explicit-exit-notify cannot be used with --mode server");
-#endif
       if (options->routes && (options->routes->flags & RG_ENABLE))
 	msg (M_USAGE, "--redirect-gateway cannot be used with --mode server (however --push \"redirect-gateway\" is fine)");
       if (options->route_delay_defined)
@@ -2049,8 +2150,8 @@ options_postprocess_verify_ce (const struct options *options, const struct conne
 			     || PLUGIN_OPTION_LIST (options)
 			     || MAN_CLIENT_AUTH_ENABLED (options));
 	  const char *postfix = "must be used with --management-client-auth, an --auth-user-pass-verify script, or plugin";
-	  if ((options->ssl_flags & SSLF_CLIENT_CERT_NOT_REQUIRED) && !ccnr)
-	    msg (M_USAGE, "--client-cert-not-required %s", postfix);
+	  if ((options->ssl_flags & (SSLF_CLIENT_CERT_NOT_REQUIRED|SSLF_CLIENT_CERT_OPTIONAL)) && !ccnr)
+	    msg (M_USAGE, "--verify-client-cert none|optional %s", postfix);
 	  if ((options->ssl_flags & SSLF_USERNAME_AS_COMMON_NAME) && !ccnr)
 	    msg (M_USAGE, "--username-as-common-name %s", postfix);
 	  if ((options->ssl_flags & SSLF_AUTH_USER_PASS_OPTIONAL) && !ccnr)
@@ -2084,8 +2185,8 @@ options_postprocess_verify_ce (const struct options *options, const struct conne
 	msg (M_USAGE, "--duplicate-cn requires --mode server");
       if (options->cf_max || options->cf_per)
 	msg (M_USAGE, "--connect-freq requires --mode server");
-      if (options->ssl_flags & SSLF_CLIENT_CERT_NOT_REQUIRED)
-	msg (M_USAGE, "--client-cert-not-required requires --mode server");
+      if (options->ssl_flags & (SSLF_CLIENT_CERT_NOT_REQUIRED|SSLF_CLIENT_CERT_OPTIONAL))
+	msg (M_USAGE, "--client-cert-not-required and --verify-client-cert require --mode server");
       if (options->ssl_flags & SSLF_USERNAME_AS_COMMON_NAME)
 	msg (M_USAGE, "--username-as-common-name requires --mode server");
       if (options->ssl_flags & SSLF_AUTH_USER_PASS_OPTIONAL)
@@ -2131,6 +2232,13 @@ options_postprocess_verify_ce (const struct options *options, const struct conne
   if (options->tls_server + options->tls_client +
       (options->shared_secret_file != NULL) > 1)
     msg (M_USAGE, "specify only one of --tls-server, --tls-client, or --secret");
+
+  if (options->ssl_flags & (SSLF_CLIENT_CERT_NOT_REQUIRED|SSLF_CLIENT_CERT_OPTIONAL))
+    {
+      msg (M_WARN, "WARNING: POTENTIALLY DANGEROUS OPTION "
+	  "--verify-client-cert none|optional (or --client-cert-not-required) "
+	  "may accept clients which do not present a certificate");
+    }
 
   if (options->tls_server || options->tls_client)
     {
@@ -2191,8 +2299,8 @@ options_postprocess_verify_ce (const struct options *options, const struct conne
 #endif
       if (options->pkcs12_file)
         {
-#ifdef ENABLE_CRYPTO_POLARSSL
-	  msg(M_USAGE, "Parameter --pkcs12 cannot be used with the PolarSSL version version of OpenVPN.");
+#ifdef ENABLE_CRYPTO_MBEDTLS
+	  msg(M_USAGE, "Parameter --pkcs12 cannot be used with the mbed TLS version version of OpenVPN.");
 #else
           if (options->ca_path)
 	    msg(M_USAGE, "Parameter --capath cannot be used when --pkcs12 is also specified.");
@@ -2210,11 +2318,11 @@ options_postprocess_verify_ce (const struct options *options, const struct conne
         }
       else
         {
-#ifdef ENABLE_CRYPTO_POLARSSL
+#ifdef ENABLE_CRYPTO_MBEDTLS
 	  if (!(options->ca_file))
 	    msg(M_USAGE, "You must define CA file (--ca)");
           if (options->ca_path)
-            msg(M_USAGE, "Parameter --capath cannot be used with the PolarSSL version version of OpenVPN.");
+            msg(M_USAGE, "Parameter --capath cannot be used with the mbed TLS version version of OpenVPN.");
 #else
 	  if ((!(options->ca_file)) && (!(options->ca_path)))
 	    msg(M_USAGE, "You must define CA file (--ca) or CA path (--capath)");
@@ -2273,7 +2381,7 @@ options_postprocess_verify_ce (const struct options *options, const struct conne
       MUST_BE_UNDEF (dh_file);
       MUST_BE_UNDEF (cert_file);
       MUST_BE_UNDEF (priv_key_file);
-#ifndef ENABLE_CRYPTO_POLARSSL
+#ifndef ENABLE_CRYPTO_MBEDTLS
       MUST_BE_UNDEF (pkcs12_file);
 #endif
       MUST_BE_UNDEF (cipher_list);
@@ -2578,7 +2686,7 @@ check_file_access(const int type, const char *file, const int mode, const char *
   /* Is the directory path leading to the given file accessible? */
   if (type & CHKACC_DIRPATH)
     {
-      char *fullpath = strdup(file);  /* POSIX dirname() implementaion may modify its arguments */
+      char *fullpath = string_alloc (file, NULL);  /* POSIX dirname() implementaion may modify its arguments */
       char *dirpath = dirname(fullpath);
 
       if (platform_access (dirpath, mode|X_OK) != 0)
@@ -2720,8 +2828,8 @@ options_postprocess_filechecks (struct options *options)
     errs |= check_file_access_chroot (options->chroot_dir, CHKACC_FILE, options->crl_file, R_OK|X_OK,
                                "--crl-verify directory");
   else
-    errs |= check_file_access_chroot (options->chroot_dir, CHKACC_FILE, options->crl_file, R_OK,
-                               "--crl-verify");
+    errs |= check_file_access_chroot (options->chroot_dir, CHKACC_FILE|CHKACC_INLINE,
+                                      options->crl_file, R_OK, "--crl-verify");
 
   errs |= check_file_access (CHKACC_FILE|CHKACC_INLINE, options->tls_auth_file, R_OK,
                              "--tls-auth");
@@ -3012,7 +3120,8 @@ options_string (const struct options *o,
 		       o->authname, o->authname_defined,
 		       o->keysize, true, false);
 
-	buf_printf (&out, ",cipher %s", cipher_kt_name (kt.cipher));
+	buf_printf (&out, ",cipher %s",
+	    translate_cipher_name_to_openvpn(cipher_kt_name (kt.cipher)));
 	buf_printf (&out, ",auth %s", md_kt_name (kt.digest));
 	buf_printf (&out, ",keysize %d", kt.cipher_length * 8);
 	if (o->shared_secret_file)
@@ -3411,6 +3520,15 @@ usage_small (void)
   openvpn_exit (OPENVPN_EXIT_STATUS_USAGE); /* exit point */
 }
 
+#ifdef WIN32
+void show_windows_version(const unsigned int flags)
+{
+  struct gc_arena gc = gc_new ();
+  msg (flags, "Windows version %s", win32_version_string (&gc, true));
+  gc_free (&gc);
+}
+#endif
+
 void
 show_library_versions(const unsigned int flags)
 {
@@ -3436,6 +3554,9 @@ usage_version (void)
 {
   msg (M_INFO|M_NOPREFIX, "%s", title_string);
   show_library_versions( M_INFO|M_NOPREFIX );
+#ifdef WIN32
+  show_windows_version( M_INFO|M_NOPREFIX );
+#endif
   msg (M_INFO|M_NOPREFIX, "Originally developed by James Yonan");
   msg (M_INFO|M_NOPREFIX, "Copyright (C) 2002-2010 OpenVPN Technologies, Inc. <sales@openvpn.net>");
 #ifndef ENABLE_SMALL
@@ -3696,7 +3817,10 @@ read_inline_file (struct in_src *is, const char *close_tag, struct gc_arena *gc)
 
   while (in_src_get (is, line, sizeof (line)))
     {
-      if (!strncmp (line, close_tag, strlen (close_tag)))
+      char *line_ptr = line;
+      /* Remove leading spaces */
+      while (isspace(*line_ptr)) line_ptr++;
+      if (!strncmp (line_ptr, close_tag, strlen (close_tag)))
 	{
 	  endtagfound = true;
 	  break;
@@ -3788,7 +3912,7 @@ read_config_file (struct options *options,
   const int max_recursive_levels = 10;
   FILE *fp;
   int line_num;
-  char line[OPTION_LINE_SIZE];
+  char line[OPTION_LINE_SIZE+1];
   char *p[MAX_PARMS];
 
   ++level;
@@ -3806,6 +3930,10 @@ read_config_file (struct options *options,
               int offset = 0;
 	      CLEAR (p);
 	      ++line_num;
+          if (strlen(line) == OPTION_LINE_SIZE)
+              msg (msglevel, "In %s:%d: Maximum optione line length (%d) exceeded, line starts with %s",
+                   file, line_num, OPTION_LINE_SIZE, line);
+
               /* Ignore UTF-8 BOM at start of stream */
               if (line_num == 1 && strncmp (line, "\xEF\xBB\xBF", 3) == 0)
                 offset = 3;
@@ -3919,6 +4047,45 @@ parse_argv (struct options *options,
     }
 }
 
+/**
+ * Filter an option line by all pull filters.
+ *
+ * If a match is found, the line is modified depending on
+ * the filter type, and returns true. If the filter type is
+ * reject, SIGUSR1 is triggered and the return value is false.
+ * In that case the caller must end the push processing.
+ */
+static bool
+apply_pull_filter (const struct options *o, char *line)
+{
+  struct pull_filter *f;
+
+  if (!o->pull_filter_list) return true;
+
+  for (f = o->pull_filter_list->head; f; f = f->next)
+    {
+      if (f->type == PUF_TYPE_ACCEPT && strncmp (line, f->pattern, f->size) == 0)
+        {
+          msg (D_LOW, "Pushed option accepted by filter: '%s'", line);
+          return true;
+        }
+      else if (f->type == PUF_TYPE_IGNORE && strncmp (line, f->pattern, f->size) == 0)
+        {
+          msg (D_PUSH, "Pushed option removed by filter: '%s'", line);
+          *line = '\0';
+          return true;
+        }
+      else if (f->type == PUF_TYPE_REJECT && strncmp (line, f->pattern, f->size) == 0)
+        {
+          msg (M_WARN, "Pushed option rejected by filter: '%s'. Restarting.", line);
+          *line = '\0';
+          throw_signal_soft (SIGUSR1, "Offending option received from server");
+          return false;
+        }
+    }
+  return true;
+}
+
 bool
 apply_push_options (struct options *options,
 		    struct buffer *buf,
@@ -3936,6 +4103,10 @@ apply_push_options (struct options *options,
       char *p[MAX_PARMS];
       CLEAR (p);
       ++line_num;
+      if (!apply_pull_filter(options, line))
+        {
+          return false; /* Cause push/pull error and stop push processing */
+        }
       if (parse_line (line, p, SIZE (p), file, line_num, msglevel, &options->gc))
 	{
 	  add_option (options, p, file, line_num, 0, msglevel, permission_mask, option_types_found, es);
@@ -4151,7 +4322,7 @@ add_option (struct options *options,
       struct in6_addr remote = IN6ADDR_ANY_INIT;
       VERIFY_PERMISSION (OPT_P_GENERAL);
       if (p[1])
-	  get_ipv6_addr (p[1], &remote, NULL, NULL, M_WARN);
+	  get_ipv6_addr (p[1], &remote, NULL, M_WARN);
       get_default_gateway(&rgi);
       get_default_gateway_ipv6(&rgi6, &remote);
       print_default_gateway(M_INFO, &rgi, &rgi6);
@@ -4290,13 +4461,6 @@ add_option (struct options *options,
       options->management_flags |= MF_CLIENT_AUTH;
     }
 #endif
-#ifdef ENABLE_X509_TRACK
-  else if (streq (p[0], "x509-track") && p[1] && !p[2])
-    {
-      VERIFY_PERMISSION (OPT_P_GENERAL);
-      x509_track_add (&options->x509_track, p[1], msglevel, &options->gc);
-    }
-#endif
 #ifdef MANAGEMENT_PF
   else if (streq (p[0], "management-client-pf") && !p[1])
     {
@@ -4406,10 +4570,9 @@ add_option (struct options *options,
   else if (streq (p[0], "ifconfig-ipv6") && p[1] && p[2] && !p[3])
     {
       unsigned int netbits;
-      char * ipv6_local;
 
       VERIFY_PERMISSION (OPT_P_UP);
-      if ( get_ipv6_addr( p[1], NULL, &netbits, &ipv6_local, msglevel ) &&
+      if ( get_ipv6_addr( p[1], NULL, &netbits, msglevel ) &&
            ipv6_addr_safe( p[2] ) )
         {
 	  if ( netbits < 64 || netbits > 124 )
@@ -4418,11 +4581,7 @@ add_option (struct options *options,
 	      goto err;
 	    }
 
-          if (options->ifconfig_ipv6_local)
-            /* explicitly ignoring this is a const char */
-            free ((char *) options->ifconfig_ipv6_local);
-
-	  options->ifconfig_ipv6_local = ipv6_local;
+	  options->ifconfig_ipv6_local = get_ipv6_addr_no_netbits (p[1], &options->gc);
 	  options->ifconfig_ipv6_netbits = netbits;
 	  options->ifconfig_ipv6_remote = p[2];
         }
@@ -5340,6 +5499,26 @@ add_option (struct options *options,
       VERIFY_PERMISSION (OPT_P_GENERAL);
       options->route_nopull = true;
     }
+  else if (streq (p[0], "pull-filter") && p[1] && p[2] && !p[3])
+    {
+      struct pull_filter *f;
+      VERIFY_PERMISSION (OPT_P_GENERAL)
+      f = alloc_pull_filter (options, msglevel);
+
+      if (strcmp ("accept", p[1]) == 0)
+        f->type = PUF_TYPE_ACCEPT;
+      else if (strcmp ("ignore", p[1]) == 0)
+        f->type = PUF_TYPE_IGNORE;
+      else if (strcmp ("reject", p[1]) == 0)
+        f->type = PUF_TYPE_REJECT;
+      else
+        {
+          msg (msglevel, "Unknown --pull-filter type: %s", p[1]);
+          goto err;
+        }
+      f->pattern = p[2];
+      f->size = strlen(p[2]);
+    }
   else if (streq (p[0], "allow-pull-fqdn") && !p[1])
     {
       VERIFY_PERMISSION (OPT_P_GENERAL);
@@ -5486,7 +5665,7 @@ add_option (struct options *options,
       unsigned int netbits = 0;
 
       VERIFY_PERMISSION (OPT_P_GENERAL);
-      if ( ! get_ipv6_addr (p[1], &network, &netbits, NULL, lev) )
+      if ( ! get_ipv6_addr (p[1], &network, &netbits, lev) )
 	{
 	  msg (msglevel, "error parsing --server-ipv6 parameter");
 	  goto err;
@@ -5549,6 +5728,11 @@ add_option (struct options *options,
       VERIFY_PERMISSION (OPT_P_INSTANCE);
       push_reset (options);
     }
+  else if (streq (p[0], "push-remove") && p[1] && !p[2])
+    {
+      VERIFY_PERMISSION (OPT_P_INSTANCE);
+      push_remove_option (options,p[1]);
+    }
   else if (streq (p[0], "ifconfig-pool") && p[1] && p[2] && !p[4])
     {
       const int lev = M_WARN;
@@ -5597,7 +5781,7 @@ add_option (struct options *options,
       unsigned int netbits = 0;
 
       VERIFY_PERMISSION (OPT_P_GENERAL);
-      if ( ! get_ipv6_addr (p[1], &network, &netbits, NULL, lev ) )
+      if ( ! get_ipv6_addr (p[1], &network, &netbits, lev ) )
 	{
 	  msg (msglevel, "error parsing --ifconfig-ipv6-pool parameters");
 	  goto err;
@@ -5664,6 +5848,27 @@ add_option (struct options *options,
     {
       VERIFY_PERMISSION (OPT_P_GENERAL);
       options->ssl_flags |= SSLF_CLIENT_CERT_NOT_REQUIRED;
+      msg (M_WARN, "DEPRECATED OPTION: --client-cert-not-required, use --verify-client-cert instead");
+    }
+  else if (streq (p[0], "verify-client-cert") && !p[2])
+    {
+      VERIFY_PERMISSION (OPT_P_GENERAL);
+
+      /* Reset any existing flags */
+      options->ssl_flags &= ~SSLF_CLIENT_CERT_OPTIONAL;
+      options->ssl_flags &= ~SSLF_CLIENT_CERT_NOT_REQUIRED;
+      if (p[1])
+	{
+	  if (streq (p[1], "none"))
+	      options->ssl_flags |= SSLF_CLIENT_CERT_NOT_REQUIRED;
+	  else if (streq (p[1], "optional"))
+	      options->ssl_flags |= SSLF_CLIENT_CERT_OPTIONAL;
+	  else if (!streq (p[1], "require"))
+	    {
+	      msg (msglevel, "parameter to --verify-client-cert must be 'none', 'optional' or 'require'");
+	      goto err;
+	    }
+	}
     }
   else if (streq (p[0], "username-as-common-name") && !p[1])
     {
@@ -5847,7 +6052,7 @@ add_option (struct options *options,
 
       VERIFY_PERMISSION (OPT_P_INSTANCE);
 
-      if ( ! get_ipv6_addr( p[1], &local, &netbits, NULL, msglevel ) )
+      if ( ! get_ipv6_addr( p[1], &local, &netbits, msglevel ) )
 	{
 	  msg (msglevel, "cannot parse --ifconfig-ipv6-push addresses");
 	  goto err;
@@ -5855,7 +6060,7 @@ add_option (struct options *options,
 
       if ( p[2] )
 	{
-	  if ( !get_ipv6_addr( p[2], &remote, NULL, NULL, msglevel ) )
+	  if ( !get_ipv6_addr( p[2], &remote, NULL, msglevel ) )
 	    {
 	      msg( msglevel, "cannot parse --ifconfig-ipv6-push addresses");
 	      goto err;
@@ -5865,7 +6070,7 @@ add_option (struct options *options,
 	{
 	  if ( ! options->ifconfig_ipv6_local ||
 	       ! get_ipv6_addr( options->ifconfig_ipv6_local, &remote, 
-				NULL, NULL, msglevel ) )
+				NULL, msglevel ) )
 	    {
 	      msg( msglevel, "second argument to --ifconfig-ipv6-push missing and no global --ifconfig-ipv6 address set");
 	      goto err;
@@ -5876,6 +6081,7 @@ add_option (struct options *options,
       options->push_ifconfig_ipv6_local = local;
       options->push_ifconfig_ipv6_netbits = netbits;
       options->push_ifconfig_ipv6_remote = remote;
+      options->push_ifconfig_ipv6_blocked = false;
     }
   else if (streq (p[0], "disable") && !p[1])
     {
@@ -5953,6 +6159,24 @@ add_option (struct options *options,
     }
 #endif
 #endif
+  else if (streq (p[0], "msg-channel") && p[1])
+    {
+#ifdef WIN32
+      VERIFY_PERMISSION (OPT_P_GENERAL);
+      HANDLE process = GetCurrentProcess ();
+      HANDLE handle = (HANDLE) atoi (p[1]);
+      if (!DuplicateHandle (process, handle, process, &options->msg_channel, 0,
+                            FALSE, DUPLICATE_CLOSE_SOURCE | DUPLICATE_SAME_ACCESS))
+        {
+          msg (msglevel, "could not duplicate service pipe handle");
+          goto err;
+        }
+      options->route_method = ROUTE_METHOD_SERVICE;
+#else
+      msg (msglevel, "--msg-channel is only supported on Windows");
+      goto err;
+#endif
+    }
 #ifdef WIN32
   else if (streq (p[0], "win-sys") && p[1] && !p[2])
     {
@@ -6151,6 +6375,11 @@ add_option (struct options *options,
       VERIFY_PERMISSION (OPT_P_IPWIN32);
       options->tuntap_options.register_dns = true;
     }
+  else if (streq (p[0], "block-outside-dns") && !p[1])
+    {
+      VERIFY_PERMISSION (OPT_P_IPWIN32);
+      options->block_outside_dns = true;
+    }
   else if (streq (p[0], "rdns-internal") && !p[1])
      /* standalone method for internal use
       *
@@ -6282,6 +6511,11 @@ add_option (struct options *options,
 	      options->comp.alg = COMP_ALG_STUB;
 	      options->comp.flags = (COMP_F_SWAP|COMP_F_ADVERTISE_STUBS_ONLY);
 	    }
+	  else if (streq(p[1], "stub-v2"))
+	    {
+	      options->comp.alg = COMP_ALGV2_UNCOMPRESSED;
+	      options->comp.flags = COMP_F_ADVERTISE_STUBS_ONLY;
+	    }
 #if defined(ENABLE_LZO)
 	  else if (streq (p[1], "lzo"))
 	    {
@@ -6289,18 +6523,16 @@ add_option (struct options *options,
 	      options->comp.flags = 0;
 	    }
 #endif
-#if defined(ENABLE_SNAPPY)
-	  else if (streq (p[1], "snappy"))
-	    {
-	      options->comp.alg = COMP_ALG_SNAPPY;
-	      options->comp.flags = COMP_F_SWAP;
-	    }
-#endif
 #if defined(ENABLE_LZ4)
 	  else if (streq (p[1], "lz4"))
 	    {
 	      options->comp.alg = COMP_ALG_LZ4;
 	      options->comp.flags = COMP_F_SWAP;
+	    }
+	  else if (streq (p[1], "lz4-v2"))
+	    {
+	      options->comp.alg = COMP_ALGV2_LZ4;
+	      options->comp.flags = 0;
 	    }
 #endif
 	  else
@@ -6486,7 +6718,7 @@ add_option (struct options *options,
       VERIFY_PERMISSION (OPT_P_GENERAL);
       options->test_crypto = true;
     }
-#ifndef ENABLE_CRYPTO_POLARSSL
+#ifndef ENABLE_CRYPTO_MBEDTLS
   else if (streq (p[0], "engine") && !p[2])
     {
       VERIFY_PERMISSION (OPT_P_GENERAL);
@@ -6497,7 +6729,7 @@ add_option (struct options *options,
       else
 	options->engine = "auto";
     }  
-#endif /* ENABLE_CRYPTO_POLARSSL */
+#endif /* ENABLE_CRYPTO_MBEDTLS */
 #ifdef HAVE_EVP_CIPHER_CTX_SET_KEY_LENGTH
   else if (streq (p[0], "keysize") && p[1] && !p[2])
     {
@@ -6554,13 +6786,13 @@ add_option (struct options *options,
 	  options->ca_file_inline = p[2];
 	}
     }
-#ifndef ENABLE_CRYPTO_POLARSSL
+#ifndef ENABLE_CRYPTO_MBEDTLS
   else if (streq (p[0], "capath") && p[1] && !p[2])
     {
       VERIFY_PERMISSION (OPT_P_GENERAL);
       options->ca_path = p[1];
     }
-#endif /* ENABLE_CRYPTO_POLARSSL */
+#endif /* ENABLE_CRYPTO_MBEDTLS */
   else if (streq (p[0], "dh") && p[1] && ((streq (p[1], INLINE_FILE_TAG) && p[2]) || !p[2]) && !p[3])
     {
       VERIFY_PERMISSION (OPT_P_GENERAL);
@@ -6637,7 +6869,7 @@ add_option (struct options *options,
 	  ~(SSLF_TLS_VERSION_MAX_MASK << SSLF_TLS_VERSION_MAX_SHIFT);
       options->ssl_flags |= (ver << SSLF_TLS_VERSION_MAX_SHIFT);
     }
-#ifndef ENABLE_CRYPTO_POLARSSL
+#ifndef ENABLE_CRYPTO_MBEDTLS
   else if (streq (p[0], "pkcs12") && p[1] && ((streq (p[1], INLINE_FILE_TAG) && p[2]) || !p[2]) && !p[3])
     {
       VERIFY_PERMISSION (OPT_P_GENERAL);
@@ -6647,7 +6879,7 @@ add_option (struct options *options,
 	  options->pkcs12_file_inline = p[2];
 	}
     }
-#endif /* ENABLE_CRYPTO_POLARSSL */
+#endif /* ENABLE_CRYPTO_MBEDTLS */
   else if (streq (p[0], "askpass") && !p[2])
     {
       VERIFY_PERMISSION (OPT_P_GENERAL);
@@ -6694,12 +6926,17 @@ add_option (struct options *options,
       VERIFY_PERMISSION (OPT_P_GENERAL);
       options->cipher_list = p[1];
     }
-  else if (streq (p[0], "crl-verify") && p[1] && ((p[2] && streq(p[2], "dir")) || !p[2]) && !p[3])
+  else if (streq (p[0], "crl-verify") && p[1] && ((p[2] && streq(p[2], "dir"))
+		  || (p[2] && streq (p[1], INLINE_FILE_TAG) ) || !p[2]) && !p[3])
     {
       VERIFY_PERMISSION (OPT_P_GENERAL);
       if (p[2] && streq(p[2], "dir"))
 	options->ssl_flags |= SSLF_CRL_VERIFY_DIR;
       options->crl_file = p[1];
+      if (streq (p[1], INLINE_FILE_TAG) && p[2])
+	{
+	  options->crl_file_inline = p[2];
+	}
     }
   else if (streq (p[0], "tls-verify") && p[1])
     {
@@ -6710,7 +6947,7 @@ add_option (struct options *options,
 		       string_substitute (p[1], ',', ' ', &options->gc),
 		       "tls-verify", true);
     }
-#ifndef ENABLE_CRYPTO_POLARSSL
+#ifndef ENABLE_CRYPTO_MBEDTLS
   else if (streq (p[0], "tls-export-cert") && p[1] && !p[2])
     {
       VERIFY_PERMISSION (OPT_P_GENERAL);
@@ -6932,6 +7169,11 @@ add_option (struct options *options,
 	}
       options->key_method = key_method;
     }
+  else if (streq (p[0], "x509-track") && p[1] && !p[2])
+    {
+      VERIFY_PERMISSION (OPT_P_GENERAL);
+      x509_track_add (&options->x509_track, p[1], msglevel, &options->gc);
+    }
 #ifdef ENABLE_X509ALTUSERNAME
   else if (streq (p[0], "x509-username-field") && p[1] && !p[2])
     {
@@ -7066,6 +7308,29 @@ add_option (struct options *options,
       options->use_peer_id = true;
       options->peer_id = atoi(p[1]);
     }
+#if defined(ENABLE_CRYPTO_OPENSSL) && OPENSSL_VERSION_NUMBER >= 0x10001000
+  else if (streq (p[0], "keying-material-exporter") && p[1] && p[2])
+    {
+      int ekm_length = positive_atoi (p[2]);
+
+      VERIFY_PERMISSION (OPT_P_GENERAL);
+
+      if (strncmp(p[1], "EXPORTER", 8))
+        {
+          msg (msglevel, "Keying material exporter label must begin with "
+                         "\"EXPORTER\"");
+          goto err;
+        }
+      if (ekm_length < 16 || ekm_length > 4095)
+        {
+          msg (msglevel, "Invalid keying material exporter length");
+          goto err;
+        }
+
+      options->keying_material_exporter_label = p[1];
+      options->keying_material_exporter_length = ekm_length;
+    }
+#endif
   else
     {
       int i;

@@ -50,7 +50,13 @@
 #endif
 
 #ifdef WIN32
+#include "openvpn-msg.h"
+
 #define METRIC_NOT_USED ((DWORD)-1)
+static bool add_route_service (const struct route_ipv4 *, const struct tuntap *);
+static bool del_route_service (const struct route_ipv4 *, const struct tuntap *);
+static bool add_route_ipv6_service (const struct route_ipv6 *, const struct tuntap *);
+static bool del_route_ipv6_service (const struct route_ipv6 *, const struct tuntap *);
 #endif
 
 static void delete_route (struct route_ipv4 *r, const struct tuntap *tt, unsigned int flags, const struct route_gateway_info *rgi, const struct env_set *es);
@@ -380,7 +386,7 @@ init_route_ipv6 (struct route_ipv6 *r6,
 {
   CLEAR (*r6);
 
-  if ( !get_ipv6_addr( r6o->prefix, &r6->network, &r6->netbits, NULL, M_WARN ))
+  if ( !get_ipv6_addr( r6o->prefix, &r6->network, &r6->netbits, M_WARN ))
     goto fail;
 
   /* gateway */
@@ -634,7 +640,7 @@ init_route_list (struct route_list *rl,
     struct route_option *ro;
     for (ro = opt->routes; ro; ro = ro->next)
       {
-        struct addrinfo* netlist;
+        struct addrinfo* netlist = NULL;
 	struct route_ipv4 r;
 
 	if (!init_route (&r, &netlist, ro, rl))
@@ -642,7 +648,6 @@ init_route_list (struct route_list *rl,
 	else
 	  {
             struct addrinfo* curele;
-            gc_addspecial(netlist, &gc_freeaddrinfo_callback, &gc);
             for (curele	= netlist; curele; curele = curele->ai_next)
 	      {
                 struct route_ipv4 *new;
@@ -653,6 +658,8 @@ init_route_list (struct route_list *rl,
                 rl->routes = new;
 	      }
 	  }
+	if (netlist)
+	  gc_addspecial(netlist, &gc_freeaddrinfo_callback, &gc);
       }
   }
 
@@ -1092,8 +1099,10 @@ add_routes (struct route_list *rl, struct route_ipv6_list *rl6, const struct tun
 	  management_set_state (management,
 				OPENVPN_STATE_ADD_ROUTES,
 				NULL,
-				0,
-				0);
+                                NULL,
+                                NULL,
+                                NULL,
+                                NULL);
 	}
 #endif
 
@@ -1465,7 +1474,12 @@ add_route (struct route_ipv4 *r,
 
     argv_msg (D_ROUTE, &argv);
 
-    if ((flags & ROUTE_METHOD_MASK) == ROUTE_METHOD_IPAPI)
+    if ((flags & ROUTE_METHOD_MASK) == ROUTE_METHOD_SERVICE)
+      {
+        status = add_route_service (r, tt);
+        msg (D_ROUTE, "Route addition via service %s", status ? "succeeded" : "failed");
+      }
+    else if ((flags & ROUTE_METHOD_MASK) == ROUTE_METHOD_IPAPI)
       {
 	status = add_route_ipapi (r, tt, ai);
 	msg (D_ROUTE, "Route addition via IPAPI %s", status ? "succeeded" : "failed");
@@ -1634,26 +1648,23 @@ add_route (struct route_ipv4 *r,
 }
 
 
-static const char * 
-print_in6_addr_netbits_only( struct in6_addr network_copy, int netbits, 
-                             struct gc_arena * gc)
+static void
+route_ipv6_clear_host_bits( struct route_ipv6 *r6 )
 {
   /* clear host bit parts of route 
    * (needed if routes are specified improperly, or if we need to 
    * explicitely setup/clear the "connected" network routes on some OSes)
    */
   int byte = 15;
-  int bits_to_clear = 128 - netbits;
+  int bits_to_clear = 128 - r6->netbits;
 
   while( byte >= 0 && bits_to_clear > 0 )
     {
       if ( bits_to_clear >= 8 )
-	{ network_copy.s6_addr[byte--] = 0; bits_to_clear -= 8; }
+	{ r6->network.s6_addr[byte--] = 0; bits_to_clear -= 8; }
       else
-	{ network_copy.s6_addr[byte--] &= (0xff << bits_to_clear); bits_to_clear = 0; }
+	{ r6->network.s6_addr[byte--] &= (0xff << bits_to_clear); bits_to_clear = 0; }
     }
-
-  return print_in6_addr( network_copy, 0, gc);
 }
 
 void
@@ -1684,7 +1695,9 @@ add_route_ipv6 (struct route_ipv6 *r6, const struct tuntap *tt, unsigned int fla
   gc_init (&gc);
   argv_init (&argv);
 
-  network = print_in6_addr_netbits_only( r6->network, r6->netbits, &gc);
+  route_ipv6_clear_host_bits (r6);
+
+  network = print_in6_addr( r6->network, 0, &gc);
   gateway = print_in6_addr( r6->gateway, 0, &gc);
 
 #if defined(TARGET_DARWIN) || \
@@ -1767,39 +1780,56 @@ add_route_ipv6 (struct route_ipv6 *r6, const struct tuntap *tt, unsigned int fla
 
 #elif defined (WIN32)
 
-  /* netsh interface ipv6 add route 2001:db8::/32 MyTunDevice */
-  argv_printf (&argv, "%s%sc interface ipv6 add route %s/%d %s",
-	       get_win_sys_path(),
-	       NETSH_PATH_SUFFIX,
-	       network,
-	       r6->netbits,
-	       device);
-
-  /* next-hop depends on TUN or TAP mode:
-   * - in TAP mode, we use the "real" next-hop
-   * - in TUN mode we use a special-case link-local address that the tapdrvr
-   *   knows about and will answer ND (neighbor discovery) packets for
-   */
-  if ( tt->type == DEV_TYPE_TUN && !gateway_needed )
-	argv_printf_cat( &argv, " %s", "fe80::8" );
+  if (tt->options.msg_channel)
+    status = add_route_ipv6_service (r6, tt);
   else
-	argv_printf_cat( &argv, " %s", gateway );
+    {
+      struct buffer out = alloc_buf_gc (64, &gc);
+      if ( r6->adapter_index )		/* vpn server special route */
+	{
+	  buf_printf (&out, "interface=%d", r6->adapter_index );
+	  gateway_needed = true;
+	}
+      else
+	{
+	  buf_printf (&out, "interface=%d", tt->adapter_index );
+	}
+      device = buf_bptr(&out);
+
+      /* netsh interface ipv6 add route 2001:db8::/32 MyTunDevice */
+      argv_printf (&argv, "%s%sc interface ipv6 add route %s/%d %s",
+		   get_win_sys_path(),
+		   NETSH_PATH_SUFFIX,
+		   network,
+		   r6->netbits,
+		   device);
+
+      /* next-hop depends on TUN or TAP mode:
+       * - in TAP mode, we use the "real" next-hop
+       * - in TUN mode we use a special-case link-local address that the tapdrvr
+       *   knows about and will answer ND (neighbor discovery) packets for
+       */
+      if ( tt->type == DEV_TYPE_TUN && !gateway_needed )
+	    argv_printf_cat( &argv, " %s", "fe80::8" );
+      else if ( !IN6_IS_ADDR_UNSPECIFIED(&r6->gateway) )
+	    argv_printf_cat( &argv, " %s", gateway );
 
 #if 0
-  if (r6->flags & RT_METRIC_DEFINED)
-    argv_printf_cat (&argv, " METRIC %d", r->metric);
+      if (r6->flags & RT_METRIC_DEFINED)
+	argv_printf_cat (&argv, " METRIC %d", r->metric);
 #endif
 
-  /* in some versions of Windows, routes are persistent across reboots by
-   * default, unless "store=active" is set (pointed out by Tony Lim, thanks)
-   */
-  argv_printf_cat( &argv, " store=active" );
+      /* in some versions of Windows, routes are persistent across reboots by
+       * default, unless "store=active" is set (pointed out by Tony Lim, thanks)
+       */
+      argv_printf_cat( &argv, " store=active" );
 
-  argv_msg (D_ROUTE, &argv);
+      argv_msg (D_ROUTE, &argv);
 
-  netcmd_semaphore_lock ();
-  status = openvpn_execve_check (&argv, es, 0, "ERROR: Windows route add ipv6 command failed");
-  netcmd_semaphore_release ();
+      netcmd_semaphore_lock ();
+      status = openvpn_execve_check (&argv, es, 0, "ERROR: Windows route add ipv6 command failed");
+      netcmd_semaphore_release ();
+    }
 
 #elif defined (TARGET_SOLARIS)
 
@@ -1950,7 +1980,12 @@ delete_route (struct route_ipv4 *r,
 
   argv_msg (D_ROUTE, &argv);
 
-  if ((flags & ROUTE_METHOD_MASK) == ROUTE_METHOD_IPAPI)
+  if ((flags & ROUTE_METHOD_MASK) == ROUTE_METHOD_SERVICE)
+    {
+      const bool status = del_route_service (r, tt);
+      msg (D_ROUTE, "Route deletion via service %s", status ? "succeeded" : "failed");
+    }
+  else if ((flags & ROUTE_METHOD_MASK) == ROUTE_METHOD_IPAPI)
     {
       const bool status = del_route_ipapi (r, tt);
       msg (D_ROUTE, "Route deletion via IPAPI %s", status ? "succeeded" : "failed");
@@ -2092,7 +2127,7 @@ delete_route_ipv6 (const struct route_ipv6 *r6, const struct tuntap *tt, unsigne
   gc_init (&gc);
   argv_init (&argv);
 
-  network = print_in6_addr_netbits_only( r6->network, r6->netbits, &gc);
+  network = print_in6_addr( r6->network, 0, &gc);
   gateway = print_in6_addr( r6->gateway, 0, &gc);
 
 #if defined(TARGET_DARWIN) || \
@@ -2157,41 +2192,58 @@ delete_route_ipv6 (const struct route_ipv6 *r6, const struct tuntap *tt, unsigne
 
 #elif defined (WIN32)
 
-  /* netsh interface ipv6 delete route 2001:db8::/32 MyTunDevice */
-  argv_printf (&argv, "%s%sc interface ipv6 delete route %s/%d %s",
-	       get_win_sys_path(),
-	       NETSH_PATH_SUFFIX,
-	       network,
-	       r6->netbits,
-	       device);
-
-  /* next-hop depends on TUN or TAP mode:
-   * - in TAP mode, we use the "real" next-hop
-   * - in TUN mode we use a special-case link-local address that the tapdrvr
-   *   knows about and will answer ND (neighbor discovery) packets for
-   * (and "route deletion without specifying next-hop" does not work...)
-   */
-  if ( tt->type == DEV_TYPE_TUN )
-	argv_printf_cat( &argv, " %s", "fe80::8" );
+  if (tt->options.msg_channel)
+    del_route_ipv6_service (r6, tt);
   else
-	argv_printf_cat( &argv, " %s", gateway );
+    {
+      struct buffer out = alloc_buf_gc (64, &gc);
+      if ( r6->adapter_index )		/* vpn server special route */
+	{
+	  buf_printf (&out, "interface=%d", r6->adapter_index );
+	  gateway_needed = true;
+	}
+      else
+	{
+	  buf_printf (&out, "interface=%d", tt->adapter_index );
+	}
+      device = buf_bptr(&out);
+
+      /* netsh interface ipv6 delete route 2001:db8::/32 MyTunDevice */
+      argv_printf (&argv, "%s%sc interface ipv6 delete route %s/%d %s",
+		   get_win_sys_path(),
+		   NETSH_PATH_SUFFIX,
+		   network,
+		   r6->netbits,
+		   device);
+
+      /* next-hop depends on TUN or TAP mode:
+       * - in TAP mode, we use the "real" next-hop
+       * - in TUN mode we use a special-case link-local address that the tapdrvr
+       *   knows about and will answer ND (neighbor discovery) packets for
+       * (and "route deletion without specifying next-hop" does not work...)
+       */
+      if ( tt->type == DEV_TYPE_TUN && !gateway_needed )
+	    argv_printf_cat( &argv, " %s", "fe80::8" );
+      else if ( !IN6_IS_ADDR_UNSPECIFIED(&r6->gateway) )
+	    argv_printf_cat( &argv, " %s", gateway );
 
 #if 0
-  if (r6->flags & RT_METRIC_DEFINED)
-    argv_printf_cat (&argv, "METRIC %d", r->metric);
+      if (r6->flags & RT_METRIC_DEFINED)
+	argv_printf_cat (&argv, "METRIC %d", r->metric);
 #endif
 
-  /* Windows XP to 7 "just delete" routes, wherever they came from, but
-   * in Windows 8(.1?), if you create them with "store=active", this is
-   * how you should delete them as well (pointed out by Cedric Tabary)
-   */
-  argv_printf_cat( &argv, " store=active" );
+      /* Windows XP to 7 "just delete" routes, wherever they came from, but
+       * in Windows 8(.1?), if you create them with "store=active", this is
+       * how you should delete them as well (pointed out by Cedric Tabary)
+       */
+      argv_printf_cat( &argv, " store=active" );
 
-  argv_msg (D_ROUTE, &argv);
+      argv_msg (D_ROUTE, &argv);
 
-  netcmd_semaphore_lock ();
-  openvpn_execve_check (&argv, es, 0, "ERROR: Windows route delete ipv6 command failed");
-  netcmd_semaphore_release ();
+      netcmd_semaphore_lock ();
+      openvpn_execve_check (&argv, es, 0, "ERROR: Windows route delete ipv6 command failed");
+      netcmd_semaphore_release ();
+    }
 
 #elif defined (TARGET_SOLARIS)
 
@@ -2497,15 +2549,79 @@ windows_route_find_if_index (const struct route_ipv4 *r, const struct tuntap *tt
   return ret;
 }
 
-/* IPv6 implementation using GetIpForwardTable2() and dynamic linking (TBD)
- * https://msdn.microsoft.com/en-us/library/windows/desktop/aa814416(v=vs.85).aspx
+/* IPv6 implementation using GetBestRoute2()
+ *   (TBD: dynamic linking so the binary can still run on XP?)
+ * https://msdn.microsoft.com/en-us/library/windows/desktop/aa365922(v=vs.85).aspx
+ * https://msdn.microsoft.com/en-us/library/windows/desktop/aa814411(v=vs.85).aspx
  */
 void
 get_default_gateway_ipv6(struct route_ipv6_gateway_info *rgi6,
 			 const struct in6_addr *dest)
 {
-    msg(D_ROUTE, "no support for get_default_gateway_ipv6() on this system (windows)");
+    struct gc_arena gc = gc_new ();
+    MIB_IPFORWARD_ROW2 BestRoute;
+    SOCKADDR_INET DestinationAddress, BestSourceAddress;
+    DWORD BestIfIndex;
+    DWORD status;
+    NET_LUID InterfaceLuid;
+
     CLEAR(*rgi6);
+    CLEAR(InterfaceLuid);		// cleared = not used for lookup
+    CLEAR(DestinationAddress);
+
+    DestinationAddress.si_family = AF_INET6;
+    if ( dest )
+    {
+        DestinationAddress.Ipv6.sin6_addr = *dest;
+    }
+
+    status = GetBestInterfaceEx( &DestinationAddress, &BestIfIndex );
+
+    if (status != NO_ERROR)
+    {
+	msg (D_ROUTE, "NOTE: GetBestInterfaceEx returned error: %s (code=%u)",
+	       strerror_win32 (status, &gc),
+	       (unsigned int)status);
+	goto done;
+    }
+
+    msg( D_ROUTE, "GetBestInterfaceEx() returned if=%d", (int) BestIfIndex );
+
+    status = GetBestRoute2( &InterfaceLuid, BestIfIndex, NULL,
+                            &DestinationAddress, 0,
+                            &BestRoute, &BestSourceAddress );
+
+    if (status != NO_ERROR)
+    {
+	msg (D_ROUTE, "NOTE: GetIpForwardEntry2 returned error: %s (code=%u)",
+	       strerror_win32 (status, &gc),
+	       (unsigned int)status);
+	goto done;
+    }
+
+    msg( D_ROUTE, "GDG6: II=%d DP=%s/%d NH=%s",
+	BestRoute.InterfaceIndex,
+	print_in6_addr( BestRoute.DestinationPrefix.Prefix.Ipv6.sin6_addr, 0, &gc),
+	BestRoute.DestinationPrefix.PrefixLength,
+	print_in6_addr( BestRoute.NextHop.Ipv6.sin6_addr, 0, &gc) );
+    msg( D_ROUTE, "GDG6: Metric=%d, Loopback=%d, AA=%d, I=%d",
+	(int) BestRoute.Metric,
+	(int) BestRoute.Loopback,
+	(int) BestRoute.AutoconfigureAddress,
+	(int) BestRoute.Immortal );
+
+    rgi6->gateway.addr_ipv6 = BestRoute.NextHop.Ipv6.sin6_addr;
+    rgi6->adapter_index     = BestRoute.InterfaceIndex;
+    rgi6->flags |= RGI_ADDR_DEFINED | RGI_IFACE_DEFINED;
+
+    /* on-link is signalled by receiving an empty (::) NextHop */
+    if ( IN6_IS_ADDR_UNSPECIFIED(&BestRoute.NextHop.Ipv6.sin6_addr) )
+      {
+	rgi6->flags |= RGI_ON_LINK;
+      }
+
+  done:
+    gc_free (&gc);
 }
 
 bool
@@ -2612,6 +2728,126 @@ del_route_ipapi (const struct route_ipv4 *r, const struct tuntap *tt)
 
   gc_free (&gc);
   return ret;
+}
+
+static bool
+do_route_service (const bool add, const route_message_t *rt, const size_t size, HANDLE pipe)
+{
+  DWORD len;
+  bool ret = false;
+  ack_message_t ack;
+  struct gc_arena gc = gc_new ();
+
+  if (!WriteFile (pipe, rt, size, &len, NULL) ||
+      !ReadFile (pipe, &ack, sizeof (ack), &len, NULL))
+    {
+      msg (M_WARN, "ROUTE: could not talk to service: %s [%lu]",
+           strerror_win32 (GetLastError (), &gc), GetLastError ());
+      goto out;
+    }
+
+  if (ack.error_number != NO_ERROR)
+    {
+      msg (M_WARN, "ROUTE: route %s failed using service: %s [status=%u if_index=%lu]",
+           (add ? "addition" : "deletion"), strerror_win32 (ack.error_number, &gc),
+           ack.error_number, rt->iface.index);
+      goto out;
+    }
+
+  ret = true;
+
+out:
+  gc_free (&gc);
+  return ret;
+}
+
+static bool
+do_route_ipv4_service (const bool add, const struct route_ipv4 *r, const struct tuntap *tt)
+{
+  DWORD if_index = windows_route_find_if_index (r, tt);
+  if (if_index == ~0)
+    return false;
+
+  route_message_t msg = {
+    .header = {
+      (add ? msg_add_route : msg_del_route),
+      sizeof (route_message_t),
+      0 },
+    .family = AF_INET,
+    .prefix.ipv4.s_addr = htonl(r->network),
+    .gateway.ipv4.s_addr = htonl(r->gateway),
+    .iface = { .index = if_index, .name = "" },
+    .metric = (r->flags & RT_METRIC_DEFINED ? r->metric : -1)
+  };
+
+  netmask_to_netbits (r->network, r->netmask, &msg.prefix_len);
+  if (msg.prefix_len == -1)
+    msg.prefix_len = 32;
+
+  return do_route_service (add, &msg, sizeof (msg), tt->options.msg_channel);
+}
+
+static bool
+do_route_ipv6_service (const bool add, const struct route_ipv6 *r, const struct tuntap *tt)
+{
+  bool status;
+  route_message_t msg = {
+    .header = {
+      (add ? msg_add_route : msg_del_route),
+      sizeof (route_message_t),
+      0 },
+    .family = AF_INET6,
+    .prefix.ipv6 = r->network,
+    .prefix_len = r->netbits,
+    .gateway.ipv6 = r->gateway,
+    .iface = { .index = tt->adapter_index, .name = "" },
+    .metric = ( (r->flags & RT_METRIC_DEFINED) ? r->metric : -1)
+  };
+
+  if ( r->adapter_index )		/* vpn server special route */
+    msg.iface.index = r->adapter_index;
+
+  /* In TUN mode we use a special link-local address as the next hop.
+   * The tapdrvr knows about it and will answer neighbor discovery packets.
+   */
+  if (tt->type == DEV_TYPE_TUN)
+    inet_pton (AF_INET6, "fe80::8", &msg.gateway.ipv6);
+
+  if (msg.iface.index == TUN_ADAPTER_INDEX_INVALID)
+    {
+      strncpy (msg.iface.name, tt->actual_name, sizeof (msg.iface.name));
+      msg.iface.name[sizeof (msg.iface.name) - 1] = '\0';
+    }
+
+  status = do_route_service (add, &msg, sizeof (msg), tt->options.msg_channel);
+  msg (D_ROUTE, "IPv6 route %s via service %s",
+			add ? "addition" : "deletion",
+			status ? "succeeded" : "failed");
+  return status;
+}
+
+static bool
+add_route_service (const struct route_ipv4 *r, const struct tuntap *tt)
+{
+  return do_route_ipv4_service (true, r, tt);
+}
+
+static bool
+del_route_service (const struct route_ipv4 *r, const struct tuntap *tt)
+{
+  return do_route_ipv4_service (false, r, tt);
+}
+
+static bool
+add_route_ipv6_service (const struct route_ipv6 *r, const struct tuntap *tt)
+{
+  return do_route_ipv6_service (true, r, tt);
+}
+
+static bool
+del_route_ipv6_service (const struct route_ipv6 *r, const struct tuntap *tt)
+{
+  return do_route_ipv6_service (false, r, tt);
 }
 
 static const char *
@@ -3037,7 +3273,8 @@ get_default_gateway (struct route_gateway_info *rgi)
   struct gc_arena gc = gc_new ();
   struct rtmsg m_rtmsg;
   int sockfd = -1;
-  int seq, l, pid, rtm_addrs, i;
+  int seq, l, pid, rtm_addrs;
+  unsigned int i;
   struct sockaddr so_dst, so_mask;
   char *cp = m_rtmsg.m_space; 
   struct sockaddr *gate = NULL, *ifp = NULL, *sa;
@@ -3239,7 +3476,8 @@ get_default_gateway_ipv6(struct route_ipv6_gateway_info *rgi6,
 
     struct rtmsg m_rtmsg;
     int sockfd = -1;
-    int seq, l, pid, rtm_addrs, i;
+    int seq, l, pid, rtm_addrs;
+    unsigned int i;
     struct sockaddr_in6 so_dst, so_mask;
     char *cp = m_rtmsg.m_space;
     struct sockaddr *gate = NULL, *ifp = NULL, *sa;

@@ -66,6 +66,7 @@ struct key_schedule
   struct tls_root_ctx ssl_ctx;
 
   /* optional authentication HMAC key for TLS control channel */
+  struct key_type tls_auth_key_type;
   struct key_ctx_bi tls_auth_key;
 #else				/* ENABLE_CRYPTO */
   int dummy;
@@ -130,13 +131,15 @@ struct context_persist
  *
  * Level 0 state is initialized once at program startup, and then remains
  * throughout the lifetime of the OpenVPN process.  This structure
- * contains information related to the process's PID, user, and group.
+ * contains information related to the process's PID, user, group, and
+ * privileges.
  */
 struct context_0
 {
   /* workspace for --user/--group */
   bool uid_gid_specified;
-  bool uid_gid_set;
+  /* helper which tells us whether we should keep trying to drop privileges */
+  bool uid_gid_chroot_set;
   struct platform_state_user platform_state_user;
   struct platform_state_group platform_state_group;
 };
@@ -241,6 +244,9 @@ struct context_2
 #  define MANAGEMENT_READ  (1<<6)
 #  define MANAGEMENT_WRITE (1<<7)
 # endif
+#ifdef ENABLE_ASYNC_PUSH
+# define FILE_CLOSED       (1<<8)
+#endif
 
   unsigned int event_set_status;
 
@@ -355,8 +361,6 @@ struct context_2
                                  *   Channel Crypto module\endlink to
                                  *   process data channel packet. */
 
-  /* used to keep track of data channel packet sequence numbers */
-  struct packet_id packet_id;
   struct event_timeout packet_id_persist_interval;
 
 #endif /* ENABLE_CRYPTO */
@@ -436,6 +440,9 @@ struct context_2
 #if P2MP_SERVER
   /* --ifconfig endpoints to be pushed to client */
   bool push_reply_deferred;
+#ifdef ENABLE_ASYNC_PUSH
+  bool push_request_received;
+#endif
   bool push_ifconfig_defined;
   time_t sent_push_reply_expiry;
   in_addr_t push_ifconfig_local;
@@ -478,6 +485,10 @@ struct context_2
 
 #ifdef MANAGEMENT_DEF_AUTH
   struct man_def_auth_context mda_context;
+#endif
+
+#ifdef ENABLE_ASYNC_PUSH
+  int inotify_fd; /* descriptor for monitoring file changes */
 #endif
 };
 

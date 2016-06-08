@@ -133,6 +133,38 @@ bool tls_ctx_initialised(struct tls_root_ctx *ctx)
   return NULL != ctx->ctx;
 }
 
+void
+key_state_export_keying_material(struct key_state_ssl *ssl,
+                                 struct tls_session *session)
+{
+  if (session->opt->ekm_size > 0)
+    {
+#if (OPENSSL_VERSION_NUMBER >= 0x10001000)
+      unsigned int size = session->opt->ekm_size;
+      struct gc_arena gc = gc_new();
+      unsigned char* ekm = (unsigned char*) gc_malloc(size, true, &gc);
+
+      if (SSL_export_keying_material(ssl->ssl, ekm, size,
+          session->opt->ekm_label, session->opt->ekm_label_size, NULL, 0, 0))
+       {
+         unsigned int len = (size * 2) + 2;
+
+         const char *key = format_hex_ex (ekm, size, len, 0, NULL, &gc);
+         setenv_str (session->opt->es, "exported_keying_material", key);
+
+         dmsg(D_TLS_DEBUG_MED, "%s: exported keying material: %s",
+              __func__, key);
+       }
+      else
+       {
+         msg (M_WARN, "WARNING: Export keying material failed!");
+         setenv_del (session->opt->es, "exported_keying_material");
+       }
+      gc_free(&gc);
+#endif
+    }
+}
+
 /*
  * Print debugging information on SSL/TLS session negotiation.
  */
@@ -181,6 +213,9 @@ tls_ctx_set_options (struct tls_root_ctx *ctx, unsigned int ssl_flags)
 {
   ASSERT(NULL != ctx);
 
+  /* default certificate verification flags */
+  int flags = SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
+
   /* process SSL options including minimum TLS version we will accept from peer */
   {
     long sslopt = SSL_OP_SINGLE_DH_USE | SSL_OP_NO_TICKET | SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3;
@@ -220,14 +255,14 @@ tls_ctx_set_options (struct tls_root_ctx *ctx, unsigned int ssl_flags)
 #if P2MP_SERVER
   if (ssl_flags & SSLF_CLIENT_CERT_NOT_REQUIRED)
     {
-      msg (M_WARN, "WARNING: POTENTIALLY DANGEROUS OPTION "
-	  "--client-cert-not-required may accept clients which do not present "
-	  "a certificate");
+      flags = 0;
     }
-  else
+  else if (ssl_flags & SSLF_CLIENT_CERT_OPTIONAL)
+    {
+      flags = SSL_VERIFY_PEER;
+    }
 #endif
-  SSL_CTX_set_verify (ctx->ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
-		      verify_callback);
+  SSL_CTX_set_verify (ctx->ctx, flags, verify_callback);
 
   SSL_CTX_set_info_callback (ctx->ctx, info_callback);
 }
@@ -237,8 +272,18 @@ tls_ctx_restrict_ciphers(struct tls_root_ctx *ctx, const char *ciphers)
 {
   if (ciphers == NULL)
     {
-      /* Use sane default (disable export, and unsupported cipher modes) */
-      if(!SSL_CTX_set_cipher_list(ctx->ctx, "DEFAULT:!EXP:!PSK:!SRP:!kRSA"))
+      /* Use sane default TLS cipher list */
+      if(!SSL_CTX_set_cipher_list(ctx->ctx,
+	  /* Use openssl's default list as a basis */
+	  "DEFAULT"
+	  /* Disable export ciphers and openssl's 'low' and 'medium' ciphers */
+	  ":!EXP:!LOW:!MEDIUM"
+	  /* Disable static (EC)DH keys (no forward secrecy) */
+	  ":!kDH:!kECDH"
+	  /* Disable DSA private keys */
+	  ":!DSS"
+	  /* Disable unsupported TLS modes */
+	  ":!PSK:!SRP:!kRSA"))
 	crypto_msg (M_FATAL, "Failed to set default TLS cipher list.");
       return;
     }
@@ -272,7 +317,7 @@ tls_ctx_restrict_ciphers(struct tls_root_ctx *ctx, const char *ciphers)
           // Issue warning on missing translation
           // %.*s format specifier expects length of type int, so guarantee
           // that length is small enough and cast to int.
-          msg (M_WARN, "No valid translation found for TLS cipher '%.*s'",
+          msg (D_LOW, "No valid translation found for TLS cipher '%.*s'",
                  constrain_int(current_cipher_len, 0, 256), current_cipher);
         }
       else
@@ -313,6 +358,55 @@ tls_ctx_restrict_ciphers(struct tls_root_ctx *ctx, const char *ciphers)
   // Set OpenSSL cipher list
   if(!SSL_CTX_set_cipher_list(ctx->ctx, openssl_ciphers))
     crypto_msg (M_FATAL, "Failed to set restricted TLS cipher list: %s", openssl_ciphers);
+}
+
+void
+tls_ctx_check_cert_time (const struct tls_root_ctx *ctx)
+{
+  int ret;
+  const X509 *cert;
+
+  ASSERT (ctx);
+
+#if OPENSSL_VERSION_NUMBER >= 0x10002000L && !defined(LIBRESSL_VERSION_NUMBER)
+  /* OpenSSL 1.0.2 and up */
+  cert = SSL_CTX_get0_certificate (ctx->ctx);
+#else
+  /* OpenSSL 1.0.1 and earlier need an SSL object to get at the certificate */
+  SSL *ssl = SSL_new (ctx->ctx);
+  cert = SSL_get_certificate (ssl);
+#endif
+
+  if (cert == NULL)
+    {
+      goto cleanup; /* Nothing to check if there is no certificate */
+    }
+
+  ret = X509_cmp_time (X509_get_notBefore (cert), NULL);
+  if (ret == 0)
+    {
+      msg (D_TLS_DEBUG_MED, "Failed to read certificate notBefore field.");
+    }
+  if (ret > 0)
+    {
+      msg (M_WARN, "WARNING: Your certificate is not yet valid!");
+    }
+
+  ret = X509_cmp_time (X509_get_notAfter (cert), NULL);
+  if (ret == 0)
+    {
+      msg (D_TLS_DEBUG_MED, "Failed to read certificate notAfter field.");
+    }
+  if (ret < 0)
+    {
+      msg (M_WARN, "WARNING: Your certificate has expired!");
+    }
+
+cleanup:
+#if OPENSSL_VERSION_NUMBER < 0x10002000L || defined(LIBRESSL_VERSION_NUMBER)
+  SSL_free (ssl);
+#endif
+  return;
 }
 
 void
@@ -1414,31 +1508,24 @@ show_available_curves()
   size_t n = 0;
 
   crv_len = EC_get_builtin_curves(NULL, 0);
+  ALLOC_ARRAY(curves, EC_builtin_curve, crv_len);
+  if (EC_get_builtin_curves(curves, crv_len))
+  {
+    printf ("Available Elliptic curves:\n");
+    for (n = 0; n < crv_len; n++)
+    {
+      const char *sname;
+      sname   = OBJ_nid2sn(curves[n].nid);
+      if (sname == NULL) sname = "";
 
-  curves = OPENSSL_malloc((int)(sizeof(EC_builtin_curve) * crv_len));
-
-  if (curves == NULL)
-    crypto_msg (M_FATAL, "Cannot create EC_builtin_curve object");
+      printf("%s\n", sname);
+    }
+  }
   else
   {
-    if (EC_get_builtin_curves(curves, crv_len))
-    {
-      printf ("Available Elliptic curves:\n");
-      for (n = 0; n < crv_len; n++)
-      {
-        const char *sname;
-        sname   = OBJ_nid2sn(curves[n].nid);
-        if (sname == NULL) sname = "";
-
-        printf("%s\n", sname);
-      }
-    }
-    else
-    {
-      crypto_msg (M_FATAL, "Cannot get list of builtin curves");
-    }
-    OPENSSL_free(curves);
+    crypto_msg (M_FATAL, "Cannot get list of builtin curves");
   }
+  free(curves);
 #else
   msg (M_WARN, "Your OpenSSL library was built without elliptic curve support. "
 	       "No curves available.");
